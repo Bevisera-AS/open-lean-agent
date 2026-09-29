@@ -1,0 +1,6 @@
+.lake/
+.lean-spec-audit/
+.lean-spec/
+
+.lean-agent-audit/
+.lean-agent-sandbox/

@@ -1,0 +1,3 @@
+{"kind":"extract","model":"x","prompt":"Specify theme selection as a requirement.","providerId":"ollama","runId":"run-fixture-extract","spec":{"id":"theme.selection","scenarios":[{"check":{"tag":"executable"},"given":"the app is in light mode","name":"toggle dark","then":"the app switches to dark mode and persists the choice","when":"the user clicks the theme toggle"}],"shall":"The app lets users switch between light and dark themes, defaulting to system preference.","strength":"shall"},"tag":"header","toolsOffered":[]}
+{"content":"theme.selection","tag":"finish"}
+{"reason":"finished","tag":"stop"}
