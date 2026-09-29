@@ -175,6 +175,14 @@ examples/Multiagent.lean    — multi-agent example with typed handoff
 This package builds independently and must not import `LeanSpec.*` or
 `LeanSpecAgent.*`; a test (`checkImportFirewall`) enforces that.
 
+## Source
+
+Canonical hosting is on GitLab (`bevisera/open-lean-agent`). A read-only
+[GitHub mirror](https://github.com/Bevisera-AS/open-lean-agent) is kept in sync
+for discovery and tooling that expects GitHub; open issues and PRs against GitLab
+when you can.
+
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE). Copyright 2026 Bevisera AS
+([NOTICE](NOTICE)).
