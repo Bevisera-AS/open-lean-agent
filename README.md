@@ -11,16 +11,33 @@ error, never a silent runtime path. JSON decoding is fail-closed (unknown fields
 are rejected). Secrets are modeled as environment-variable *names*, never values,
 and never appear in process arguments or transcripts.
 
-Split from `lean-spec`. Same toolchain: Lean 4.33.
+Split from `lean-spec`. Same toolchain: Lean 4.35.
 
 ## Validate
 
 ```sh
-lake build && lake test
+lake build                                        # the LeanAgent library
+lake build lean-agent lean-agent-tests multiagent # the three executables
+lake test
+lake check --paranoid                             # Linux only; see below
 ```
 
 `lake build` also runs the pervasive compile-time `#guard` checks; `lake test`
 additionally runs the `lean-agent-tests` binary.
+
+Under Lean 4.35.0, `lake check --paranoid` accepts the library, sandboxed, with all
+six bundled checkers, including the verified kernels con-leche and con-ron, and
+with only the standard axioms (`propext`, `Quot.sound`, `Classical.choice`). CI
+runs it on every merge request, on `main` and on tags. lean-agent has no theorems,
+so this re-checks its definitions and rules out `sorry` and `native_decide`; the
+`#guard`s are evaluated at build time and are not part of what the kernels see.
+
+`lake check` sandboxes the build with `bwrap`, so it needs Linux user namespaces. In
+Docker that means `--privileged`; on Ubuntu 24.04 it means lifting AppArmor's
+`kernel.apparmor_restrict_unprivileged_userns`. Keep the Lean toolchain outside the
+project directory, or `lake check` stalls at "Resolving dependencies".
+[`docs/lake-check-paranoid-report.md`](docs/lake-check-paranoid-report.md) records
+the run, what it does and does not establish, and how the CI job is set up.
 
 ## Quick start
 
@@ -170,6 +187,8 @@ LeanAgent/
 LeanAgentQuery.lean         — CLI (live-ping | ask | replay-transcript)
 LeanAgentTests.lean         — runtime test binary
 examples/Multiagent.lean    — multi-agent example with typed handoff
+ci/Dockerfile               — pinned CI image (Lean toolchain + bubblewrap)
+docs/                       — lake check --paranoid report
 ```
 
 This package builds independently and must not import `LeanSpec.*` or
