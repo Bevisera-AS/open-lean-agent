@@ -4,3 +4,5 @@
 
 .lean-agent-audit/
 .lean-agent-sandbox/
+.elan/
+lake-check.log
