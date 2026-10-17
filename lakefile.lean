@@ -4,10 +4,15 @@ open Lake DSL
 package «lean-agent» where
   precompileModules := false
 
+@[default_target]
 lean_lib LeanAgent where
   globs := #[.submodules `LeanAgent]
 
-@[default_target]
+/- The executables are not default targets. `lake check` exports every default
+target into one environment, and each executable root defines `main`, so two of
+them cannot be imported together. Build them by name:
+`lake build lean-agent lean-agent-tests multiagent`. -/
+
 lean_exe «lean-agent» where
   root := `LeanAgentQuery
 
