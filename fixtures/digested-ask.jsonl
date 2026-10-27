@@ -1,0 +1,7 @@
+{"digest":"sha256:96c11ad350c7770316ad5c565e4fa33c9e3f6f9fe5daabb0add4638ddbce2a7e","kind":"ask","model":"x","prompt":"Echo the word lean back to me.","providerId":"ollama","runId":"run-fixture-digest","spec":null,"tag":"header","toolsOffered":["echo","arxiv_search"],"usage":{"completionTokens":8,"promptTokens":12,"totalTokens":20}}
+{"content":"The user wants the word echoed; use the echo tool.","tag":"reasoning","turn":1}
+{"callId":"c1","tag":"invoke","tool":{"tag":"echo","text":"lean"}}
+{"callId":"c1","output":"lean","tag":"result"}
+{"content":"The tool returned the word; report it.","tag":"reasoning","turn":2}
+{"content":"lean","tag":"finish"}
+{"reason":"finished","tag":"stop"}

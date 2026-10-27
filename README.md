@@ -17,7 +17,7 @@ Split from `lean-spec`. Same toolchain: Lean 4.35.
 
 ```sh
 lake build                                        # the LeanAgent library
-lake build lean-agent lean-agent-tests multiagent # the three executables
+lake build lean-agent lean-agent-tests multiagent spec-loop # the four executables
 lake test
 lake check --paranoid                             # Linux only; see below
 ```
@@ -28,9 +28,20 @@ additionally runs the `lean-agent-tests` binary.
 Under Lean 4.35.0, `lake check --paranoid` accepts the library, sandboxed, with all
 six bundled checkers, including the verified kernels con-leche and con-ron, and
 with only the standard axioms (`propext`, `Quot.sound`, `Classical.choice`). CI
-runs it on every merge request, on `main` and on tags. lean-agent has no theorems,
-so this re-checks its definitions and rules out `sorry` and `native_decide`; the
-`#guard`s are evaluated at build time and are not part of what the kernels see.
+runs it on every merge request, on `main` and on tags. The pure checks that the
+kernel can decide are theorems, proved `by decide`: the path rule
+(`Files.safeRelPath`), fail-closed field decoding, off-catalog tool refusal, the
+usage object's closed keys, the fixture contract's round trip, echo replay
+against a tampered result (`LeanAgent/Theorems.lean`, `LeanAgent/Files.lean`),
+and the FIPS 180-4 "abc" vector for the transcript digest
+(`Sha256.hashBytes_abc`). Those check one input each. The quantified facts are
+theorems next to their decoders: `decode` succeeds only on a name the catalog
+declares, for every string (`mkToolSet_decode_declared`,
+`decodeDemoTool_ok_name`, and the tagged, run-kind, event and stop forms).
+Those are what `lake check` re-verifies, besides the definitions and the
+absence of `sorry` and `native_decide`. The remaining `#guard`s and the test binary are evaluated by
+the compiler and interpreter at build and test time and are not part of what
+the kernels see.
 
 `lake check` sandboxes the build with `bwrap`, so it needs Linux user namespaces. In
 Docker that means `--privileged`; on Ubuntu 24.04 it means lifting AppArmor's
@@ -38,6 +49,31 @@ Docker that means `--privileged`; on Ubuntu 24.04 it means lifting AppArmor's
 project directory, or `lake check` stalls at "Resolving dependencies".
 [`docs/lake-check-paranoid-report.md`](docs/lake-check-paranoid-report.md) records
 the run, what it does and does not establish, and how the CI job is set up.
+
+## What is checked, and by what
+
+Three columns, because the claims differ in kind. The first is a type: the
+value cannot exist. The second is a check that runs at build or test time, or
+a theorem the kernel re-verifies. The third is what this package does not
+confine, so a caller who needs it must add it outside.
+
+| Claim | Rejected by the type | Checked by `#guard`, theorem or `lake test` | Not confined |
+| --- | --- | --- | --- |
+| A tool the role did not list | its name is not a constructor of the role's `Tool`; `decode` yields `invalidTag` | theorems `mkToolSet_decode_declared` (every DSL catalog, every string) and `decodeDemoTool_ok_name`; `decode_rejects_off_catalog` on one string; a guard per role | what a listed tool does once it runs |
+| Every constructor has a catalog entry, every entry a constructor, names unique | | `ToolSet.covers` guard per catalog on `samples% Tool`, the sample list generated from the inductive | a catalog whose fields are not all strings writes its samples by hand |
+| Unknown JSON field, blank value | | theorem `exactFields_rejects_unknown`; theorems `decodeUsage_rejects_*` on the header's usage object; guards per decoder | |
+| An unlisted provider | `ProviderId` is a closed inductive | `namedProvider` test | |
+| API keys | modeled as env-var names | tests: never in argv, never in the JSONL | the key's use by curl |
+| The `ask` loop terminates with a typed `StopReason`, even when a tool throws | | tests: refusal, transport, truncation, throwing runner | |
+| Replay detects a tampered pure-tool result | | theorem `replay_rejects_tampered_result` | observations (`arxiv_search`, files, lake) keep the recorded string |
+| The digest covers every line, usage included | | `lake test`: an edited finish or reasoning line, a usage key the encoder never writes, a deleted digest under `DigestPolicy.require` | the digest is not a signature; a decode under `verifyIfPresent` accepts a header with no digest |
+| A file tool stays under its root | | theorems on `safeRelPath` (lexical); `lake test` on `Files.confine`, which follows symlinks | a hard link; a path the OS user can reach that the real path check mis-reads |
+| A builder run stays in its project | | `lake test`: a project outside the root, or reached through a symlink out of it, is refused; names cannot be flags | the lakefile is a program, and so is the project `lean` elaborates; `lean_check` runs a snippet's `IO` on this host |
+| A run is bounded by a timeout | | `lake test`: `Verify.runBounded` kills the process group past the deadline, an orphaned grandchild on the pipe included, and returns within the grace; without a `timeout` or `pgrep` binary | a descendant that leaves the group with its own `setsid` is not signalled; it is not waited on either |
+| `ToolEffect` | | `covers` guards that each tool carries its declared effect | `ToolRunner.run` is `Tool → IO String`; the effect is a label the caller checks, not a bound the runner proves |
+| The spec loop has no shell | `Workbench` has no shell constructor | guard: `run_command` is refused | `write_file` can replace `./build`, `./test.sh` or `./next`, and `run_script` runs them: for a coding agent that is the point, and the referee's scripts are the confinement |
+| `OutputContract` schema and decoder agree | | `OutputContract.ofFields` builds both from one field list; `schemaAgrees` and `roundTrips` guards | a hand-written contract that skips them |
+| `requireCite` | | | no catalog in this package marks a tool `isCite`; with these catalogs the flag can only refuse (lean-spec's `show` is the cite tool) |
 
 ## Quick start
 
@@ -47,11 +83,16 @@ LEAN_AGENT_MODEL=qwen3:8b lake exe lean-agent live-ping
 LEAN_AGENT_MODEL=qwen3:8b lake exe lean-agent ask
 LEAN_AGENT_MODEL=qwen3:8b lake exe lean-agent ask "Search arXiv for category theory in Lean"
 
-# Replay a saved transcript without calling a model
-lake exe lean-agent replay-transcript < fixtures/extract-theme.jsonl
+# Replay a saved transcript without calling a model (the header must carry a digest)
+lake exe lean-agent replay-transcript < fixtures/digested-ask.jsonl
+# A transcript written before digests existed needs the flag
+lake exe lean-agent replay-transcript --allow-missing-digest < fixtures/extract-theme.jsonl
 
 # The multi-agent example (offline, deterministic)
 lake exe multiagent
+
+# The spec loop: builder, referee, reviewer (offline, deterministic)
+lake exe spec-loop
 ```
 
 Stdout is the model's final answer; diagnostics go to stderr. Runs write an
@@ -60,8 +101,10 @@ audit transcript under `.lean-agent-audit/` (override with `LEAN_AGENT_AUDIT_DIR
 ## Providers
 
 `LEAN_AGENT_PROVIDER` selects the base config: `ollama` (default),
-`bedrock-mantle`, `openai`, `anthropic`, or `glm`. Overlay the model and base URL
-with `LEAN_AGENT_MODEL` / `LEAN_AGENT_BASE_URL`.
+`bedrock-mantle`, `openai`, `anthropic`, or `glm`. Overlay the model, base URL
+and output cap with `LEAN_AGENT_MODEL` / `LEAN_AGENT_BASE_URL` /
+`LEAN_AGENT_MAX_TOKENS` (the default cap is 1024; a reasoning model spends it on
+its reasoning, so raise it).
 
 | Provider        | Protocol            | API key env               |
 | --------------- | ------------------- | ------------------------- |
@@ -84,14 +127,20 @@ provider-agnostic.
   `transport` / `truncated`).
 * **Structured output (`extract`)** — Instructor-style. An `OutputContract α`
   ties a JSON schema to a Lean decode/encode plus a well-formedness predicate.
+  `OutputContract.ofFields` builds the schema and the unknown-field check from
+  one field list; `roundTrips` and `schemaAgrees` state the contract's law.
   Decode failures are repaired up to a bound; truncation is fatal.
 * **Closed tool catalogs** — a `ToolSet Tool` is a caller-owned closed algebra;
   a name outside the constructors cannot be invoked. Kernel tools: `echo`,
   `arxiv_search`. Role tools (below): `web_search`, `read_file`, `list_dir`,
-  `write_file`.
+  `write_file`, `lean_check`, `toolchain`, `lake_build`, `lake_test`,
+  `leanchecker`, `leanchecker_paranoid`.
 * **Auditable transcripts** — JSONL, one object per line, with a fail-closed
-  decoder and `replay` that re-checks recorded pure-tool results (tamper-evident
-  for deterministic tools).
+  decoder, a SHA-256 content digest in the header that the decoder verifies
+  (tamper-evident for every line, model free text included), and `replay` that
+  re-executes recorded pure-tool results (tamper-evident without trusting the
+  writer, for deterministic tools). A tool that throws becomes a tool-error
+  result in the transcript, never a lost receipt.
 * **Retry classification** — HTTP status is recovered from curl's `-w` output;
   429 and 5xx retry, authentication and other 4xx are fatal, transient network
   failures (timeout, connection reset/refused) retry.
@@ -109,7 +158,7 @@ treated as output, and is ignored by `replay`, so it cannot spoof the
 tamper-evidence check. Absence of reasoning is never an error.
 
 ```jsonl
-{"tag":"header","runId":"run-...","kind":"ask","prompt":"...","providerId":"ollama","model":"...","toolsOffered":["arxiv_search"],"spec":null}
+{"tag":"header","runId":"run-...","kind":"ask","prompt":"...","providerId":"ollama","model":"...","toolsOffered":["arxiv_search"],"spec":null,"digest":"sha256:<64 hex>"}
 {"tag":"reasoning","turn":1,"content":"I should search arXiv before answering."}
 {"tag":"invoke","callId":"c1","tool":{"tag":"arxiv_search","query":"lean 4"}}
 {"tag":"result","callId":"c1","output":"..."}
@@ -117,9 +166,28 @@ tamper-evidence check. Absence of reasoning is never an error.
 {"tag":"stop","reason":"finished"}
 ```
 
-> Replay gives tamper-evidence for pure tool results only. Model free-text
-> (reasoning and `finish`) is on the record but not integrity-checked; a content
-> digest over the canonical transcript would close that gap.
+Two checks cover the record. `replay` re-executes pure tools (`echo`) and compares
+the recorded result, which needs no trust in whoever wrote the file but says
+nothing about model free text. The header **digest** closes that gap: it is
+SHA-256 over the *canonical transcript* — the header without its `digest` key,
+then every event line, then the stop line, each rendered by `Json.compress` and
+joined by `\n` with no trailing newline (`canonicalJsonlWith`; a transcript
+written before 0.3 is exactly this form). `decodeJsonlWith` recomputes it from the
+decoded value and refuses a mismatch with `illFormed "header.digest" "mismatch"`,
+so an edited `reasoning` or `finish` line, prompt, tool call or stop reason never
+decodes, let alone replays. A header without `digest` decodes under
+`DigestPolicy.verifyIfPresent`, the library default (older transcripts and
+`fixtures/extract-theme.jsonl`), and is refused under `DigestPolicy.require`,
+which `replay-transcript` uses unless given `--allow-missing-digest`: deleting
+the key is then not a way to make an edited file decode.
+`fixtures/digested-ask.jsonl` pins the canonical form. The header's `usage`
+object is decoded fail-closed like every other field (`decodeUsage`): a key the
+encoder never writes, or a count that is not a number or `null`, is a decode
+error, so no text can sit in the raw file outside what the digest covers. SHA-256 is `LeanAgent/Sha256.lean`, pure Lean over
+`UInt32`s with no host dependency, so a second Lean program can check a digest
+without trusting `shasum`; the FIPS vectors are `#guard`s and the "abc" one is also
+a kernel-checked theorem. The digest is not a signature: it detects edits, not a
+rewrite by someone who recomputes it.
 
 ## Multi-agent
 
@@ -132,10 +200,26 @@ defines role-scoped catalogs:
 * **academic-researcher** — `arxiv_search` only.
 * **file-reader** — `read_file` / `list_dir` (no write).
 * **file-writer** — `read_file` / `write_file`, sandboxed to a root directory.
+* **verifier** — `lean_check`: compile a Lean snippet in a temp directory.
+* **builder** — `toolchain`, `lake_build`, `lake_test`, `leanchecker`,
+  `leanchecker_paranoid` on a real project inside a sandbox root. Each run is
+  bounded by a timeout (enforced in Lean on the whole process group, no
+  `timeout` binary needed) and
+  returns a verdict with `file:line:column` diagnostics; target and module
+  names cannot be flags. Every builder tool is declared with effect `verify`:
+  the tools themselves write build artifacts, never sources, git or a store,
+  and `covers` checks each carries that label. The label does not bind the
+  lakefile, which is a Lean program `lake` runs.
+  `lake check --paranoid` is not offered: it needs Linux sandboxing (see Validate).
 
 File tools resolve paths against a sandbox root and reject absolute paths, `~`,
-and `..` traversal (`Files.safeRelPath`). A reader agent simply never offers a
-write tool, so the capability boundary is structural.
+and `..` traversal (`Files.safeRelPath`, lexical), then follow symlinks and
+refuse any path whose real location leaves the root (`Files.confine`, before
+every read, list or write; a dangling symlink is never written through). A
+reader agent simply never offers a write tool, so the capability boundary is
+structural. The builder's project path takes the same check; what the project's
+lakefile does once `lake` runs it is not confined, and neither is the `IO` a
+`lean_check` snippet can run while it elaborates.
 
 ### Typed handoff (Lean value or JSON, not markdown)
 
@@ -169,6 +253,33 @@ It runs offline against scripted completers (`lake exe multiagent`); switching t
 real providers is a one-line change — `curlCompleter agent.cfg` — with `liveOllama`
 and `liveBedrock` at the bottom of the file showing local and Bedrock variants.
 
+## The spec loop
+
+`examples/SpecLoop.lean` is lean-spec's builder–referee–reviewer loop on these
+pieces. The catalog, referee and finish gate are `LeanAgent/Workbench.lean`, so a
+bridge can import them; this example does not import LeanSpec, and its `Finding`
+stays local. The **builder** is an `Agent` over a closed `Workbench` catalog (read,
+write, list, run a workspace script, pipe an input through the program, run the
+spec CLI); there is no shell in the catalog, so the model cannot name one. It
+can write `./build`, `./test.sh` or `./next` and then run them, so a shell is one
+write away: for a coding agent that is the job, and the confinement is the
+referee's scripts and the workspace, not the catalog. The
+**referee** is a program: `lake exe spec check`, `./test.sh`, and `./next`, which
+releases the next change request only when the tests pass and records the stages
+released in `stage.json`; `refereeGate`, the loop's finish hook
+(`AskPolicy.onFinish`), reads it after every model finish and either accepts or
+nudges the model in the same history. The builder runs on the kernel's one loop,
+`askWith`, which runs every tool call of a turn in order. The **reviewer** is the
+read-only `Roles.Reader` agent, and its findings come back through the fail-closed
+`OutputContract` as typed `Finding` values (run, requirement, kind, severity,
+evidence, note), the row shape of lean-spec's `bench/Findings.lean`.
+
+`lake exe spec-loop` runs it offline against scripted completers and a stub
+referee (`fixtures/spec-loop`); `lake exe spec-loop live BENCH TASK LANG ARM SEED
+MODEL` drives one lean-spec bench seed with GLM through z.ai, prepares and scores
+the workspace with the bench's own scripts, and writes the audited transcript next
+to `meta.json`.
+
 ## Layout
 
 ```
@@ -180,13 +291,21 @@ LeanAgent/
   Anthropic, OpenAICompat   — per-protocol request/response encoders + reasoning extraction
   Step, Retry               — decode a model move; classify failures / repair
   OutputContract, Extract   — structured output (Instructor-style) + audited extract
-  Transcript, Generation    — JSONL audit record, replay, receipts
+  Sha256                    — pure SHA-256 for the transcript content digest
+  Transcript, Generation    — JSONL audit record, content digest, replay, receipts
+  Theorems                  — the decidable checks as kernel-checked theorems
+  Samples                   — `samples% T`: a catalog's sample list, generated from its inductive
   Arxiv, WebSearch, Files   — tool implementations (arXiv, web search, sandboxed files)
+  Verify, Build             — lean_check; toolchain, lake build/test, leanchecker
   Ask                       — the bounded agent loop
   Roles, Agents             — role catalogs + multi-agent sugar and typed handoff
-LeanAgentQuery.lean         — CLI (live-ping | ask | replay-transcript)
+  Workbench                 — spec-loop builder catalog, referee and finish gate
+LeanAgentQuery.lean         — CLI (live-ping | ask | replay-transcript | list-audits)
 LeanAgentTests.lean         — runtime test binary
 examples/Multiagent.lean    — multi-agent example with typed handoff
+examples/SpecLoop.lean      — lean-spec's builder, referee and reviewer loop
+fixtures/build-ok, build-fail — tiny packages the builder tests build
+fixtures/spec-loop          — stub workspace scripts for the offline spec loop
 ci/Dockerfile               — pinned CI image (Lean toolchain + bubblewrap)
 docs/                       — lake check --paranoid report
 ```
@@ -194,12 +313,11 @@ docs/                       — lake check --paranoid report
 This package builds independently and must not import `LeanSpec.*` or
 `LeanSpecAgent.*`; a test (`checkImportFirewall`) enforces that.
 
-## Source
+## Public release
 
-Canonical hosting is on GitLab (`bevisera/open-lean-agent`). A read-only
-[GitHub mirror](https://github.com/Bevisera-AS/open-lean-agent) is kept in sync
-for discovery and tooling that expects GitHub; open issues and PRs against GitLab
-when you can.
+A history-free public snapshot is published as
+[`bevisera/open-lean-agent`](https://gitlab.com/bevisera/open-lean-agent), with a
+read-only [GitHub mirror](https://github.com/Bevisera-AS/open-lean-agent).
 
 ## License
 

@@ -145,23 +145,29 @@ public def wrapAnthropicTruncated (content : String) : String :=
     ("stop_reason", Json.str "max_tokens")
   ])
 
-public def wrapAnthropicToolUse (id name argsJson : String) : String :=
-  let input :=
-    match Json.parse argsJson with
-    | .ok j => j
-    | .error _ => Json.mkObj []
+/-- Test envelope: an Anthropic message whose content is the given
+`(id, name, inputJson)` `tool_use` blocks, in order. -/
+public def wrapAnthropicToolUses (uses : Array (String × String × String)) : String :=
   Json.compress (Json.mkObj [
     ("id", Json.str "msg_test"),
     ("type", Json.str "message"),
     ("role", Json.str "assistant"),
-    ("content", Json.arr #[Json.mkObj [
-      ("type", Json.str "tool_use"),
-      ("id", Json.str id),
-      ("name", Json.str name),
-      ("input", input)
-    ]]),
+    ("content", Json.arr (uses.map fun (id, name, argsJson) =>
+      let input :=
+        match Json.parse argsJson with
+        | .ok j => j
+        | .error _ => Json.mkObj []
+      Json.mkObj [
+        ("type", Json.str "tool_use"),
+        ("id", Json.str id),
+        ("name", Json.str name),
+        ("input", input)
+      ])),
     ("stop_reason", Json.str "tool_use")
   ])
+
+public def wrapAnthropicToolUse (id name argsJson : String) : String :=
+  wrapAnthropicToolUses #[(id, name, argsJson)]
 
 public def anthropicContentBlocks (raw : String) : Except DecodeError (Array Json) := do
   let j ← parseJson raw

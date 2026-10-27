@@ -47,6 +47,27 @@ public structure ToolSet (Tool : Type) where
   /-- The effect classification of each tool. Defaults to `read`. -/
   effect : Tool → ToolEffect := fun _ => .read
 
+/-- Wire names in the catalog are pairwise distinct, so `decode` is unambiguous. -/
+public def ToolSet.uniqueNames {Tool : Type} (ts : ToolSet Tool) : Bool :=
+  let names := (ts.specs.map (·.name)).toList
+  names.eraseDups.length == names.length
+
+/-- The catalog and the inductive line up on `samples`: names are unique, every
+sample is named by a spec and survives the tagged round trip, and every spec
+names some sample. With one sample per constructor this is a build-time check
+that no constructor is missing an arm (a tool no declaration projects encodes as
+an empty tag, which `decodeTagged` refuses) and no declaration is dead. Pair it
+with `#guard`, as the role catalogs do. -/
+public def ToolSet.covers {Tool : Type} [BEq Tool] (ts : ToolSet Tool) (samples : List Tool) :
+    Bool :=
+  ts.uniqueNames && !samples.isEmpty &&
+    samples.all (fun t =>
+      ts.specs.any (·.name == ts.name t) &&
+        (match ts.decodeTagged (ts.encodeTagged t) with
+         | .ok t' => t' == t
+         | .error _ => false)) &&
+    ts.specs.all (fun spec => samples.any (fun t => ts.name t == spec.name))
+
 public def ToolSet.encodeCall {Tool : Type} (ts : ToolSet Tool)
     (callId : String) (tool : Tool) : Json :=
   Json.mkObj [
@@ -58,12 +79,19 @@ public def ToolSet.encodeCall {Tool : Type} (ts : ToolSet Tool)
     ])
   ]
 
-public def ToolSet.assistantInvokeMessage {Tool : Type} (ts : ToolSet Tool)
-    (callId : String) (tool : Tool) : Message := {
+/-- One assistant message carrying every call of a turn, in the model's order:
+the shape the model sent, echoed back so the tool results that follow answer it.
+The Anthropic encoder turns it into one `tool_use` block per call. -/
+public def ToolSet.assistantInvokesMessage {Tool : Type} (ts : ToolSet Tool)
+    (calls : Array (String × Tool)) : Message := {
   role := .assistant
   content := ""
-  toolCallsJson? := some (Json.compress (Json.arr #[ts.encodeCall callId tool]))
+  toolCallsJson? := some (Json.compress (Json.arr (calls.map fun (id, tool) => ts.encodeCall id tool)))
 }
+
+public def ToolSet.assistantInvokeMessage {Tool : Type} (ts : ToolSet Tool)
+    (callId : String) (tool : Tool) : Message :=
+  ts.assistantInvokesMessage #[(callId, tool)]
 
 public def toolResultMessage (callId : String) (output : String) : Message := {
   role := .tool

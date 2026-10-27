@@ -1,7 +1,8 @@
 # CI for lean-agent.
 #
-#   verify          `lake build` (the library), then the three executables by
-#                   name, then `lake test`, on merge requests, on the default
+#   verify          `lake build` (the library), then the four executables by
+#                   name, then `lake test` and the offline spec-loop example, on
+#                   merge requests, on the default
 #                   branch, on tags, and on any branch via "Run pipeline" in the
 #                   GitLab UI. Runs on Linux, a second platform from the macOS
 #                   development machine.
@@ -86,8 +87,10 @@ verify:
   timeout: 45m
   script:
     - lake build
-    - lake build lean-agent lean-agent-tests multiagent
+    - lake build lean-agent lean-agent-tests multiagent spec-loop
     - lake test
+    # The spec loop, offline: scripted models, the stub referee in fixtures/spec-loop.
+    - lake exe spec-loop
 
 kernel-check:
   extends: .lean-env

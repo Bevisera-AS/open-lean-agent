@@ -1,0 +1,17 @@
+#!/bin/sh
+# Stand-in for bench/stage.py: release the next change request only when the
+# tests pass, and record the stages passed in ../stage.json (two stages).
+st=../stage.json; i=0
+[ -f "$st" ] && i=$(sed -n 's/.*"i": *\([0-9]*\).*/\1/p' "$st")
+if ! ./test.sh > .next.out 2>&1; then
+  echo "./test.sh fails - fix it first:"; tail -n 8 .next.out; exit 1
+fi
+[ "$i" -lt 2 ] && i=$((i+1))
+printf '{"i": %s, "log": []}\n' "$i" > "$st"
+if [ "$i" -lt 2 ]; then
+  echo "Apply this change request to spec, program and tests."
+  echo
+  echo 'Change request 1: ["put", key, value] stores value under key and returns null; a later ["get", key] returns it.'
+else
+  echo "No more change requests. Reply DONE."
+fi

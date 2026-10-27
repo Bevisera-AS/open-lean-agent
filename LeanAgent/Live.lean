@@ -15,11 +15,15 @@ open Lean
 
 public section
 
-/-- Override `model` / `baseUrl` from the process environment. Secrets stay in env names, not here. -/
+/-- Override `model` / `baseUrl` / `maxTokens` from the process environment
+(`LEAN_AGENT_MODEL`, `LEAN_AGENT_BASE_URL`, `LEAN_AGENT_MAX_TOKENS`). Secrets stay
+in env names, not here. -/
 public def configFromEnv (base : ProviderConfig) : IO ProviderConfig := do
   let model? ← IO.getEnv "LEAN_AGENT_MODEL"
   let url? ← IO.getEnv "LEAN_AGENT_BASE_URL"
-  pure (overlayConfig base model? url?)
+  let max? ← IO.getEnv "LEAN_AGENT_MAX_TOKENS"
+  let cfg := overlayConfig base model? url?
+  pure { cfg with config := cfg.config.withMaxTokens (max?.bind String.toNat?) }
 
 /-- Live CLI config. `LEAN_AGENT_PROVIDER` selects the base record; overlays still apply. -/
 public def liveConfig : IO (Except String ProviderConfig) := do

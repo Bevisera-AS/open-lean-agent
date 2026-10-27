@@ -35,8 +35,9 @@ is absent from the axioms reported above, and there is no `sorry` in the sources
 
 ## What this does and does not establish
 
-lean-agent has no theorems. Its checks are 154 compile-time `#guard`s plus the
-`lean-agent-tests` binary. So `lake check` here establishes that:
+At the time of the run, lean-agent had one theorem (`GenerationReceipt.ofTranscript_sound`,
+five `rfl`s); its checks were 154 compile-time `#guard`s plus the `lean-agent-tests`
+binary. So `lake check` here establishes that:
 
 - every definition, instance and derived declaration in the library is
   type-correct, independently re-checked by six kernels, two of them verified;
@@ -46,9 +47,34 @@ lean-agent has no theorems. Its checks are 154 compile-time `#guard`s plus the
 It does **not** re-check the `#guard`s. A `#guard` is evaluated by Lean's
 interpreter when the module elaborates; its result is not stored in the exported
 environment, so no kernel sees it. The guards and the test binary remain checked by
-`lake build` and `lake test`, which trust Lean's compiler. Turning a guard into a
-theorem proved `by decide +kernel` would move it under `lake check`; see lean-spec's
-report for what that takes (predicates over `List`, `@[expose]` across modules).
+`lake build` and `lake test`, which trust Lean's compiler.
+
+Since the run, the decidable checks have been restated as theorems, proved `by
+decide` (or `by decide +kernel` where the statement folds over arrays or tree
+maps): the lexical path rule in `LeanAgent/Files.lean`, and in
+`LeanAgent/Theorems.lean` fail-closed field decoding, off-catalog tool refusal,
+the fixture contract's round trip and echo replay against a tampered result. A
+theorem's proof term is in the exported environment, so these are under `lake
+check` on the next CI run; they were not part of the run above. What it took,
+on this toolchain:
+
+- `String.any`, `String.all`, `String.splitOn` and `Array.all` do not reduce
+  under `decide`; `nonemptyText`, `safeRunId` and `safeRelPath` are now stated
+  over `List Char`, with `@[expose]` so an importing module can unfold them.
+- Inside a `module` file, `decide` cannot unfold `Lean.Data.Json` (not exposed
+  by Lean), so `Theorems.lean` is deliberately a legacy (non-`module`) file:
+  a legacy import sees every body. The library glob builds it like any module.
+- `#print axioms` on each theorem reports only `propext`, `Classical.choice` and
+  `Quot.sound`.
+
+Those `decide` theorems check one input each. The quantified statements came
+after them and are proved by case analysis, not reduction, so they do not depend
+on what `decide` can unfold and live in the `module` files next to their
+decoders: `mkToolSet_decode_declared` (`LeanAgent/ToolDSL.lean`),
+`decodeDemoTool_ok_name` (`LeanAgent/Tools.lean`), `decodeRunKind_ok`,
+`decodeEventWith_ok_tag` and `decodeStop_ok_reason`
+(`LeanAgent/Transcript.lean`). They too are under `lake check` on the next CI
+run and were not part of the run above.
 
 ## Setup findings
 

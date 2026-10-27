@@ -4,7 +4,9 @@ public import Lean.Data.Json
 public import LeanAgent.Util
 public import LeanAgent.Json
 public import LeanAgent.Step
+public import LeanAgent.Sha256
 public meta import LeanAgent.Json
+public meta import LeanAgent.Sha256
 public meta import LeanAgent.Step
 
 namespace LeanAgent
@@ -35,6 +37,16 @@ public def decodeRunKind (s : String) : Except DecodeError RunKind :=
   | "extract" => .ok .extract
   | other => .error (.invalidTag "header" "kind" other)
 
+/-- `decodeRunKind` succeeds only on the two wire names, and returns the kind
+that name denotes: the quantified form of the string-at-a-time guards. -/
+public theorem decodeRunKind_ok (s : String) (k : RunKind) (h : decodeRunKind s = .ok k) :
+    k.toWire = s := by
+  unfold decodeRunKind at h
+  split at h
+  · cases h; rfl
+  · cases h; rfl
+  · cases h
+
 public inductive Event (Tool : Type := DemoTool) where
   | invoke (callId : String) (tool : Tool)
   | result (callId : String) (output : String)
@@ -46,8 +58,8 @@ public inductive Event (Tool : Type := DemoTool) where
   | finish (content : String)
   deriving Repr, BEq
 
-public def safeRunId (s : String) : Bool :=
-  nonemptyText s && s.all fun c => c.isAlphanum || c == '-'
+@[expose] public def safeRunId (s : String) : Bool :=
+  nonemptyText s && s.toList.all fun c => c.isAlphanum || c == '-'
 
 /-- One agent run. Prompt, optional structured output JSON, events, and stop. No secrets. -/
 public structure Transcript (Tool : Type := DemoTool) where
@@ -62,24 +74,49 @@ public structure Transcript (Tool : Type := DemoTool) where
   usage : Usage := {}
   stop : StopReason
 
+/-- The event state machine: `pending` is the call awaiting its result, `finished`
+whether a finish has been seen. Every result answers the pending call; nothing
+follows a finish. -/
+public def Transcript.eventsGo {Tool : Type} (pending : Option String) (finished : Bool) :
+    List (Event Tool) → Bool
+  | [] => pending.isNone
+  | .invoke callId _tool :: rest =>
+    nonemptyText callId && pending.isNone && !finished &&
+      Transcript.eventsGo (some callId) false rest
+  | .result callId _output :: rest =>
+    match pending with
+    | some expected =>
+      expected == callId && nonemptyText callId && Transcript.eventsGo none false rest
+    | none => false
+  | .repair _ _ :: rest =>
+    pending.isNone && !finished && Transcript.eventsGo none false rest
+  | .reasoning _ content :: rest =>
+    pending.isNone && !finished && nonemptyText content && Transcript.eventsGo none false rest
+  | .finish content :: rest =>
+    pending.isNone && !finished && nonemptyText content && rest.isEmpty
+
 public def Transcript.eventsWellFormed {Tool : Type} (events : Array (Event Tool)) : Bool :=
-  let rec go (pending : Option String) (finished : Bool) : List (Event Tool) → Bool
-    | [] => pending.isNone
-    | .invoke callId _tool :: rest =>
-      nonemptyText callId && pending.isNone && !finished &&
-        go (some callId) false rest
-    | .result callId _output :: rest =>
-      match pending with
-      | some expected =>
-        expected == callId && nonemptyText callId && go none false rest
-      | none => false
-    | .repair _ _ :: rest =>
-      pending.isNone && !finished && go none false rest
-    | .reasoning _ content :: rest =>
-      pending.isNone && !finished && nonemptyText content && go none false rest
-    | .finish content :: rest =>
-      pending.isNone && !finished && nonemptyText content && rest.isEmpty
-  go none false events.toList
+  Transcript.eventsGo none false events.toList
+
+/-- One call's `invoke`/`result` pair under a non-blank call id is transparent to
+the event state machine: whatever follows it is checked from the same clean state
+(no pending call, not finished). So a turn of several calls, recorded pair by
+pair as `askWith` does, keeps `eventsWellFormed` exactly when the events around
+it do. -/
+public theorem Transcript.eventsGo_pair {Tool : Type} (callId : String) (tool : Tool)
+    (output : String) (rest : List (Event Tool)) (h : nonemptyText callId = true) :
+    Transcript.eventsGo none false (.invoke callId tool :: .result callId output :: rest) =
+      Transcript.eventsGo none false rest := by
+  simp [Transcript.eventsGo, h]
+
+/-- Two calls recorded pair by pair, then a finish: well-formed whenever the ids are
+non-blank and the finish is. -/
+public theorem Transcript.eventsGo_two_calls {Tool : Type} (c1 c2 : String) (t1 t2 : Tool)
+    (o1 o2 content : String) (h1 : nonemptyText c1 = true) (h2 : nonemptyText c2 = true)
+    (hc : nonemptyText content = true) :
+    Transcript.eventsWellFormed #[Event.invoke c1 t1, .result c1 o1, .invoke c2 t2, .result c2 o2,
+      .finish content] = true := by
+  simp [Transcript.eventsWellFormed, Transcript.eventsGo, h1, h2, hc]
 
 public def toolsOfferedCoverInvokesWith {Tool : Type} (ts : ToolSet Tool)
     (t : Transcript Tool) : Bool :=
@@ -231,7 +268,46 @@ public def decodeEventWith {Tool : Type} (ts : ToolSet Tool) (j : Json) :
 public def decodeEvent (j : Json) : Except DecodeError (Event DemoTool) :=
   decodeEventWith kernelTools j
 
-public def encodeHeader {Tool : Type} (t : Transcript Tool) : Json :=
+/-- The wire tag of an event, as `encodeEventWith` writes it. -/
+public def Event.tag {Tool : Type} : Event Tool → String
+  | .invoke _ _ => "invoke"
+  | .result _ _ => "result"
+  | .repair _ _ => "repair"
+  | .reasoning _ _ => "reasoning"
+  | .finish _ => "finish"
+
+/-- `decodeEventWith` succeeds only on an object whose `tag` is one of the five
+event tags, and the event it returns carries that tag: for every JSON value,
+not one. -/
+public theorem decodeEventWith_ok_tag {Tool : Type} (ts : ToolSet Tool) (j : Json)
+    (e : Event Tool) (h : decodeEventWith ts j = .ok e) :
+    strField "event" "tag" j = .ok e.tag := by
+  unfold decodeEventWith at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  repeat' split at h
+  all_goals first | (cases h; simp_all [Event.tag]) | cases h
+
+/-- The wire reason of a stop, as `encodeStop` writes it. -/
+public def StopReason.reason : StopReason → String
+  | .finished => "finished"
+  | .refused _ => "refused"
+  | .transport => "transport"
+  | .truncated => "truncated"
+
+/-- `decodeStop` succeeds only on an object whose `reason` is one of the four
+stop reasons, and the stop it returns carries that reason. -/
+public theorem decodeStop_ok_reason (j : Json) (r : StopReason) (h : decodeStop j = .ok r) :
+    strField "stop" "reason" j = .ok r.reason := by
+  unfold decodeStop at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  repeat' split at h
+  all_goals first | (cases h; simp_all [StopReason.reason]) | cases h
+
+/-- The header line. `digest?` is the content digest `encodeJsonlWith` computes
+over the canonical transcript; `none` renders the pre-digest header, which is
+also the digest's own input (`canonicalJsonlWith`). -/
+public def encodeHeader {Tool : Type} (t : Transcript Tool) (digest? : Option String := none) :
+    Json :=
   let specField : Json :=
     match t.outputJson? with
     | some j => j
@@ -249,44 +325,102 @@ public def encodeHeader {Tool : Type} (t : Transcript Tool) : Json :=
   ]
   -- Usage is written only when the provider reported something, keeping headers
   -- for token-less runs (and existing fixtures) unchanged.
-  if t.usage.isEmpty then
-    Json.mkObj base
-  else
-    Json.mkObj (base ++ [("usage", Json.mkObj [
-      ("promptTokens", natOr t.usage.promptTokens),
-      ("completionTokens", natOr t.usage.completionTokens),
-      ("totalTokens", natOr t.usage.totalTokens)
-    ])])
+  let withUsage :=
+    if t.usage.isEmpty then
+      base
+    else
+      base ++ [("usage", Json.mkObj [
+        ("promptTokens", natOr t.usage.promptTokens),
+        ("completionTokens", natOr t.usage.completionTokens),
+        ("totalTokens", natOr t.usage.totalTokens)
+      ])]
+  match digest? with
+  | some d => Json.mkObj (withUsage ++ [("digest", Json.str d)])
+  | none => Json.mkObj withUsage
 
-/-- Read an optional `Nat` from a JSON object field, tolerating null/absence. -/
-public def usageNat? (j : Json) (key : String) : Option Nat :=
+/-- The keys a header `usage` object may carry: exactly what `encodeHeader` writes. -/
+public def usageFields : List String := ["promptTokens", "completionTokens", "totalTokens"]
+
+/-- A token count: absent or `null` is `none`; anything but a natural number is
+a type error, so a count can be `12` or `null` and nothing else. -/
+public def usageNat? (ctx key : String) (j : Json) : Except DecodeError (Option Nat) :=
   match j.getObjVal? key with
-  | .error _ => none
-  | .ok v => match v.getNat? with | .ok n => some n | .error _ => none
+  | .error _ => .ok none
+  | .ok v =>
+    if v.isNull then .ok none
+    else match v.getNat? with
+      | .ok n => .ok (some n)
+      | .error _ => .error (.wrongType ctx key "natural number or null")
 
-/-- Decode the optional header `usage` object; absent or malformed → empty usage. -/
-public def decodeUsage (header : Json) : Usage :=
+/-- Decode the optional header `usage` object, fail-closed like every other
+header field: absent is the empty usage; present, it must be an object with no
+key outside `usageFields` and no value that is not a count or `null`. So a
+`usage` object cannot carry text the digest does not cover. -/
+public def decodeUsage (header : Json) : Except DecodeError Usage :=
+  let ctx := "header.usage"
   match header.getObjVal? "usage" with
-  | .error _ => {}
-  | .ok u =>
-    { promptTokens := usageNat? u "promptTokens"
-      completionTokens := usageNat? u "completionTokens"
-      totalTokens := usageNat? u "totalTokens" }
+  | .error _ => .ok {}
+  | .ok u => do
+    let o ← asObj ctx u
+    exactFields ctx usageFields o
+    let promptTokens ← usageNat? ctx "promptTokens" u
+    let completionTokens ← usageNat? ctx "completionTokens" u
+    let totalTokens ← usageNat? ctx "totalTokens" u
+    pure { promptTokens, completionTokens, totalTokens }
+
+/-- What `decodeJsonlWith` does with a header that carries no `digest`.
+`verifyIfPresent` accepts it as a pre-digest transcript (written before 0.3, or
+`canonicalJsonlWith` itself); `require` refuses it with
+`illFormed "header.digest" "missing"`, so deleting the key is not a way to make
+an edited file decode. A present digest is verified under both. -/
+public inductive DigestPolicy where
+  | verifyIfPresent
+  | require
+  deriving Repr, BEq, DecidableEq
 
 public def jsonlLines (s : String) : List String :=
   (s.splitOn "\n").filter nonemptyText
 
+/-- Every line after the header: the events, then the stop, each `Json.compress`ed. -/
+public def bodyLinesWith {Tool : Type} (ts : ToolSet Tool) (t : Transcript Tool) : List String :=
+  t.events.toList.map (fun e => Json.compress (encodeEventWith ts e)) ++
+    [Json.compress (encodeStop t.stop)]
+
+/-- The canonical transcript, which is what the content digest covers: the
+header without its `digest` key, then every event line, then the stop line, each
+rendered by `Json.compress` (keys in `Json.mkObj` order, no whitespace) and
+joined by a single `\n` with no trailing newline. It is computed from the
+decoded value, never from the file's bytes, so a re-indented or re-ordered file
+that decodes to the same transcript carries the same digest. (This is also the
+whole encoding of transcripts written before the digest existed.) -/
+public def canonicalJsonlWith {Tool : Type} (ts : ToolSet Tool) (t : Transcript Tool) : String :=
+  joinSep "\n" (Json.compress (encodeHeader t) :: bodyLinesWith ts t)
+
+public def digestAlgorithm : String := "sha256"
+
+/-- The content digest: `sha256:<64 lowercase hex>` over the UTF-8 bytes of
+`canonicalJsonlWith`. It covers the prompt, every tool call and result, every
+`reasoning` and `finish` line and the stop reason, so a change to model free
+text is detected even though `replay` cannot re-derive that text. -/
+public def digestWith {Tool : Type} (ts : ToolSet Tool) (t : Transcript Tool) : String :=
+  digestAlgorithm ++ ":" ++ Sha256.hexOfString (canonicalJsonlWith ts t)
+
+public def digest (t : Transcript DemoTool) : String :=
+  digestWith kernelTools t
+
+public def canonicalJsonl (t : Transcript DemoTool) : String :=
+  canonicalJsonlWith kernelTools t
+
+/-- The JSONL form that `writeAuditWith` persists: the header carrying
+`digestWith`, then the body lines. -/
 public def encodeJsonlWith {Tool : Type} (ts : ToolSet Tool) (t : Transcript Tool) : String :=
-  joinSep "\n"
-    (Json.compress (encodeHeader t) ::
-      t.events.toList.map (fun e => Json.compress (encodeEventWith ts e)) ++
-      [Json.compress (encodeStop t.stop)])
+  joinSep "\n" (Json.compress (encodeHeader t (some (digestWith ts t))) :: bodyLinesWith ts t)
 
 public def encodeJsonl (t : Transcript DemoTool) : String :=
   encodeJsonlWith kernelTools t
 
-public def decodeJsonlWith {Tool : Type} (ts : ToolSet Tool) (s : String) :
-    Except DecodeError (Transcript Tool) := do
+public def decodeJsonlWith {Tool : Type} (ts : ToolSet Tool) (s : String)
+    (policy : DigestPolicy := .verifyIfPresent) : Except DecodeError (Transcript Tool) := do
   let ls := jsonlLines s
   match ls with
   | [] => .error (.illFormed "transcript" "empty")
@@ -297,7 +431,8 @@ public def decodeJsonlWith {Tool : Type} (ts : ToolSet Tool) (s : String) :
       let header ← parseJson headerLine
       let ho ← asObj "header" header
       exactFields "header"
-        ["tag", "runId", "kind", "prompt", "providerId", "model", "toolsOffered", "spec", "usage"] ho
+        ["tag", "runId", "kind", "prompt", "providerId", "model", "toolsOffered", "spec", "usage",
+          "digest"] ho
       let htag ← strField "header" "tag" header
       if htag != "header" then
         .error (.invalidTag "header" "tag" htag)
@@ -311,7 +446,8 @@ public def decodeJsonlWith {Tool : Type} (ts : ToolSet Tool) (s : String) :
         let specJ ← field "header" "spec" header
         let outputJson? : Option Json :=
           if specJ.isNull then none else some specJ
-        let usage := decodeUsage header
+        let usage ← decodeUsage header
+        let digest? ← optStrField "header" "digest" header
         let stopJ ← parseJson stopLine
         let stop ← decodeStop stopJ
         let mid := midRev.reverse
@@ -321,11 +457,37 @@ public def decodeJsonlWith {Tool : Type} (ts : ToolSet Tool) (s : String) :
         let t : Transcript Tool := {
           runId, kind, prompt, providerId, model, toolsOffered, events, outputJson?, usage, stop
         }
-        if wellFormedWith ts t then pure t
-        else .error (.illFormed "transcript" "failed wellFormed")
+        if !wellFormedWith ts t then
+          .error (.illFormed "transcript" "failed wellFormed")
+        else
+          -- A header without `digest` is a pre-digest transcript: accepted or
+          -- refused by `policy`. One with it must match the digest recomputed from
+          -- what was decoded.
+          match digest? with
+          | none =>
+            match policy with
+            | .verifyIfPresent => pure t
+            | .require => .error (.illFormed "header.digest" "missing")
+          | some d =>
+            if !d.startsWith (digestAlgorithm ++ ":") then
+              .error (.illFormed "header.digest" "unsupported algorithm")
+            else if d != digestWith ts t then
+              .error (.illFormed "header.digest" "mismatch")
+            else
+              pure t
 
-public def decodeJsonl (s : String) : Except DecodeError (Transcript DemoTool) :=
-  decodeJsonlWith kernelTools s
+public def decodeJsonl (s : String) (policy : DigestPolicy := .verifyIfPresent) :
+    Except DecodeError (Transcript DemoTool) :=
+  decodeJsonlWith kernelTools s policy
+
+/-- The `digest` the header line declares, without decoding the rest: `none`
+for a pre-digest transcript. `decodeJsonlWith` is what verifies it. -/
+public def headerDigest? (s : String) : Except DecodeError (Option String) :=
+  match jsonlLines s with
+  | [] => .error (.illFormed "transcript" "empty")
+  | headerLine :: _ => do
+    let header ← parseJson headerLine
+    optStrField "header" "digest" header
 
 /-- Re-execute pure echo. Observations keep recorded output. Does not call a model. -/
 public def replayWith {Tool : Type} (ts : ToolSet Tool) (t : Transcript Tool) :
@@ -461,6 +623,39 @@ public def writeAudit (dir : System.FilePath) (t : Transcript DemoTool) :
     | .error _ => false
   | .error _ => false
 
+-- The digest covers model free text: changing a finish line is refused by the
+-- decoder, while the same transcript re-encoded verifies.
+#guard
+  let t : Transcript DemoTool := {
+    runId := "run-digest"
+    kind := .ask
+    prompt := "p"
+    providerId := "ollama"
+    model := "x"
+    toolsOffered := #["echo"]
+    events := #[.reasoning 1 "think", .finish "answer"]
+    stop := .finished
+  }
+  let jsonl := encodeJsonl t
+  let edited := jsonl.replace "\"content\":\"answer\"" "\"content\":\"forged\""
+  jsonl.contains ("\"digest\":\"" ++ digest t ++ "\"") &&
+    (digest t).startsWith "sha256:" && (digest t).length == 7 + 64 &&
+    (match decodeJsonl jsonl with
+     | .ok t2 => t2.events == t.events && digest t2 == digest t
+     | .error _ => false) &&
+    (match decodeJsonl edited with
+     | .error (.illFormed "header.digest" "mismatch") => true
+     | _ => false) &&
+    (match headerDigest? jsonl with
+     | .ok (some d) => d == digest t
+     | _ => false) &&
+    (match decodeJsonl (canonicalJsonl t) with   -- pre-digest form still decodes
+     | .ok t2 => t2.events == t.events
+     | .error _ => false) &&
+    (match headerDigest? (canonicalJsonl t) with
+     | .ok none => true
+     | _ => false)
+
 #guard
   let forged := "{\"tag\":\"header\",\"runId\":\"run-x\",\"kind\":\"ask\",\"prompt\":\"p\",\"providerId\":\"ollama\",\"model\":\"x\",\"toolsOffered\":[\"echo\"],\"spec\":null}\n" ++
     "{\"tag\":\"invoke\",\"callId\":\"c\",\"tool\":{\"tag\":\"shell\",\"cmd\":\"rm\"}}\n" ++
@@ -546,6 +741,37 @@ public def writeAudit (dir : System.FilePath) (t : Transcript DemoTool) :
     stop := .finished
   }
   !bad.wellFormed
+
+-- A two-call turn, as `askWith` records it, is well-formed and replays.
+#guard
+  let t : Transcript DemoTool := {
+    runId := "run-two-calls"
+    kind := .ask
+    prompt := "echo twice"
+    providerId := "ollama"
+    model := "x"
+    toolsOffered := #["echo", "arxiv_search"]
+    events := #[
+      .invoke "c1" (.echo "a"), .result "c1" "a",
+      .invoke "c2" (.echo "b"), .result "c2" "b",
+      .finish "a then b"
+    ]
+    stop := .finished
+  }
+  t.wellFormed &&
+    (match decodeJsonl (encodeJsonl t) with
+     | .ok t2 => t2.events == t.events
+     | .error _ => false) &&
+    (match replay t with
+     | .ok s => s == "a then b"
+     | .error _ => false)
+
+-- Two calls answered out of order are not: each result must answer the pending call.
+#guard
+  !Transcript.eventsWellFormed (Tool := DemoTool) #[
+    .invoke "c1" (.echo "a"), .invoke "c2" (.echo "b"),
+    .result "c1" "a", .result "c2" "b", .finish "x"
+  ]
 
 end
 

@@ -7,7 +7,7 @@ import LeanAgent.Ask
 open LeanAgent
 
 def usage : String :=
-  "usage: lean-agent (live-ping | ask [prompt…] | replay-transcript | list-audits)"
+  "usage: lean-agent (live-ping | ask [prompt…] | replay-transcript [--allow-missing-digest] | list-audits)"
 
 def fail (msg : String) : IO UInt32 := do
   IO.eprintln msg
@@ -65,14 +65,29 @@ def main (args : List String) : IO UInt32 := do
         let toks := e.usage.totalTokens.map toString |>.getD "-"
         IO.println s!"{e.runId}\t{e.providerId}\t{e.model}\t{e.kind.toWire}\t{repr e.stop}\ttokens={toks}\t{e.promptPreview}"
       return 0
-  | ["replay-transcript"] => do
+  | "replay-transcript" :: flags => do
+      let policy : DigestPolicy ←
+        match flags with
+        | [] => pure .require
+        | ["--allow-missing-digest"] => pure .verifyIfPresent
+        | _ => do IO.eprintln usage; pure .require
+      if flags != [] && flags != ["--allow-missing-digest"] then
+        fail usage
+      else
       let raw ← (← IO.getStdin).readToEnd
       if !nonemptyText raw then
-        fail "replay-transcript reads a transcript JSONL on stdin (fixtures/extract-theme.jsonl or .lean-agent-audit/run-*.jsonl)"
+        fail "replay-transcript reads a transcript JSONL on stdin (fixtures/digested-ask.jsonl or .lean-agent-audit/run-*.jsonl)"
       else
-        match decodeJsonl raw with
+        -- `decodeJsonl` verifies the header digest and, by default, requires one:
+        -- a mismatch or a missing digest is a decode error, so a tampered `finish`
+        -- or `reasoning` never replays, and neither does a file whose digest was
+        -- deleted. `--allow-missing-digest` accepts a pre-digest transcript.
+        match decodeJsonl raw policy with
         | .error e => fail e.pretty
         | .ok t =>
+            match headerDigest? raw with
+            | .ok (some d) => IO.eprintln s!"digest {d} verified"
+            | _ => IO.eprintln "no digest in header (pre-digest transcript accepted by --allow-missing-digest; pure-tool replay only)"
             match replay t with
             | .ok out =>
                 IO.println out

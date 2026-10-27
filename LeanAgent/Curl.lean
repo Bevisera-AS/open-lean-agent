@@ -24,7 +24,7 @@ public def argv (url : String) (headerFile? : Option System.FilePath) : Array St
     match headerFile? with
     | some path => #["-H", s!"@{path}"]
     | none => #[]
-  #["-sS", "--fail-with-body", "-m", "120", "-w", writeOut, "-X", "POST", url,
+  #["-sS", "--fail-with-body", "-m", "600", "-w", writeOut, "-X", "POST", url,
     "-H", "Content-Type: application/json"] ++
     auth ++
     #["--data-binary", "@-"]

@@ -1,0 +1,37 @@
+#!/bin/sh
+# Stand-in for `lake exe spec`, so the example runs without lean-spec. A spec
+# is `@[requirement]` defs whose examples are `ex "name" (json% IN) (json% OUT)`
+# lines; `check` is structural and `test PROG` pipes each example through PROG.
+case "$1" in
+  help) cat <<'TXT'
+lean-spec (stub). Spec.lean holds one @[requirement must] def per requirement,
+its docstring is the label and its examples are the tests:
+
+  /-- get of an absent key is null -/
+  @[requirement must] def R1 : IOSig → Prop := Req.holds [
+    ex "miss" (json% {"ops":[["get","a"]]}) (json% {"results":[null]})]
+
+Commands: help | check | test PROG
+TXT
+    ;;
+  check)
+    [ -f Spec.lean ] || { echo '{"problem":"no Spec.lean"}'; exit 1; }
+    grep -q '@\[requirement' Spec.lean || { echo '{"problem":"no requirements"}'; exit 1; }
+    grep -q '^ *ex "' Spec.lean || { echo '{"problem":"a requirement needs an example"}'; exit 1; }
+    echo '{"ok":true}'
+    ;;
+  test)
+    prog="${2:-./run}"; pass=0; fail=0
+    tmp=$(mktemp)
+    sed -n 's/^ *ex "\([^"]*\)" (json% \(.*\)) (json% \(.*\))\]*,*$/\1	\2	\3/p' Spec.lean > "$tmp"
+    while IFS="$(printf '\t')" read -r name in exp; do
+      got=$(printf '%s' "$in" | sh -c "$prog")
+      if [ "$got" = "$exp" ]; then pass=$((pass+1))
+      else fail=$((fail+1)); echo "FAIL $name: expected $exp, got $got"; fi
+    done < "$tmp"
+    rm -f "$tmp"
+    echo "TESTS passed=$pass failed=$fail"
+    [ "$fail" -eq 0 ]
+    ;;
+  *) echo "unknown command: $1 (help | check | test PROG)"; exit 2 ;;
+esac

@@ -74,7 +74,13 @@ are rejected with `invalidTag`, unknown fields with `unknownFields`, and blank
 values with `illFormed` — the same fail-closed behavior as a hand-written set.
 
 `execute?` defaults to observation-only (`fun _ => none`); pass a real projection
-for tools that can be replayed purely (like `echo`). -/
+for tools that can be replayed purely (like `echo`).
+
+A constructor that no declaration projects is not caught here: `name` would be
+empty and `effect` would be `.read`. Every catalog therefore `#guard`s
+`ToolSet.covers` on `samples% Tool`, one value per constructor generated from the
+inductive (`LeanAgent.Samples`), which turns a missing arm, a dead declaration
+or a duplicate name into a build error. -/
 public def mkToolSet {Tool : Type} (decls : List (ToolDecl Tool))
     (execute? : Tool → Option String := fun _ => none)
     (isCite : Tool → Bool := fun _ => false)
@@ -110,6 +116,45 @@ public def mkToolSet {Tool : Type} (decls : List (ToolDecl Tool))
       | none => .error (.invalidTag "tool" "tag" tag)
       | some d => do d.build (← readFields "tool" d.fields ["tag"] j)
   }
+
+/-! ## The quantified form, for every catalog `mkToolSet` builds -/
+
+/-- `decode` succeeds only on a declared name: for every string, not one. -/
+public theorem mkToolSet_decode_declared {Tool : Type} (decls : List (ToolDecl Tool))
+    (execute? : Tool → Option String) (isCite : Tool → Bool) (usableCite : String → Bool)
+    (name : String) (args : Json) (t : Tool)
+    (h : (mkToolSet decls execute? isCite usableCite).decode name args = .ok t) :
+    ∃ d ∈ decls, d.name = name := by
+  simp only [mkToolSet] at h
+  split at h
+  · cases h
+  · rename_i d hd
+    exact ⟨d, List.mem_of_find?_eq_some hd, by simpa using List.find?_some hd⟩
+
+/-- `decodeTagged` succeeds only on a declared tag. -/
+public theorem mkToolSet_decodeTagged_declared {Tool : Type} (decls : List (ToolDecl Tool))
+    (execute? : Tool → Option String) (isCite : Tool → Bool) (usableCite : String → Bool)
+    (j : Json) (t : Tool)
+    (h : (mkToolSet decls execute? isCite usableCite).decodeTagged j = .ok t) :
+    ∃ tag, strField "tool" "tag" j = .ok tag ∧ ∃ d ∈ decls, d.name = tag := by
+  simp only [mkToolSet, bind, Except.bind] at h
+  split at h
+  · cases h
+  · rename_i tag htag
+    refine ⟨tag, htag, ?_⟩
+    split at h
+    · cases h
+    · rename_i d hd
+      exact ⟨d, List.mem_of_find?_eq_some hd, by simpa using List.find?_some hd⟩
+
+/-- A name no declaration carries never decodes, whatever the arguments. -/
+public theorem mkToolSet_decode_off_catalog {Tool : Type} (decls : List (ToolDecl Tool))
+    (execute? : Tool → Option String) (isCite : Tool → Bool) (usableCite : String → Bool)
+    (name : String) (hn : ∀ d ∈ decls, d.name ≠ name) (args : Json) :
+    ∀ t, (mkToolSet decls execute? isCite usableCite).decode name args ≠ .ok t := by
+  intro t h
+  obtain ⟨d, hd, hname⟩ := mkToolSet_decode_declared decls execute? isCite usableCite name args t h
+  exact hn d hd hname
 
 /-! ## Convenience constructors for the most common shapes -/
 
@@ -183,6 +228,22 @@ private def demoSet : ToolSet Demo := mkToolSet [
        | .ok t2 => t2 == t
        | .error _ => false)
   | _ => false
+
+-- the catalog covers the inductive, and a missing arm is caught
+#guard demoSet.covers [.one "q", .two "p" "c"]
+#guard !demoSet.covers [.one "q"]
+private def demoSetMissingTwo : ToolSet Demo := mkToolSet [
+  toolDecl1 "search" "one field" "query" Demo.one
+    (fun | .one q => some q | _ => none)
+]
+#guard !demoSetMissingTwo.covers [.one "q", .two "p" "c"]
+private def demoSetDuplicate : ToolSet Demo := mkToolSet [
+  toolDecl1 "search" "one field" "query" Demo.one
+    (fun | .one q => some q | _ => none),
+  toolDecl2 "search" "two fields" "path" "content" Demo.two
+    (fun | .two p c => some (p, c) | _ => none)
+]
+#guard !demoSetDuplicate.covers [.one "q", .two "p" "c"]
 
 -- tagged decode rejects an off-catalog tag
 #guard

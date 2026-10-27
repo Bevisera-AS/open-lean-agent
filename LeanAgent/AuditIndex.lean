@@ -32,6 +32,9 @@ public structure AuditEntry where
   usage : Usage := {}
   file : String
   promptPreview : String := ""
+  /-- The transcript's content digest (`digestWith`); `none` for a row written
+  before digests existed. The transcript header is authoritative. -/
+  digest : Option String := none
   deriving Repr, BEq
 
 /-- Manifest file name inside the audit directory. Excluded when scanning
@@ -42,10 +45,11 @@ public def indexFileName : String := "index.jsonl"
 public def previewOf (prompt : String) : String :=
   (prompt.take 120).toString
 
-public def AuditEntry.ofTranscriptWith {Tool : Type} (file : String)
+public def AuditEntry.ofTranscriptWith {Tool : Type} (ts : ToolSet Tool) (file : String)
     (t : Transcript Tool) : AuditEntry :=
   { runId := t.runId, kind := t.kind, providerId := t.providerId, model := t.model
-    stop := t.stop, usage := t.usage, file, promptPreview := previewOf t.prompt }
+    stop := t.stop, usage := t.usage, file, promptPreview := previewOf t.prompt
+    digest := some (digestWith ts t) }
 
 private def natOr (n? : Option Nat) : Json :=
   match n? with | some n => (n : Json) | none => Json.null
@@ -63,7 +67,8 @@ public def encodeAuditEntry (e : AuditEntry) : Json :=
       ("totalTokens", natOr e.usage.totalTokens)
     ]),
     ("file", Json.str e.file),
-    ("promptPreview", Json.str e.promptPreview)
+    ("promptPreview", Json.str e.promptPreview),
+    ("digest", match e.digest with | some d => Json.str d | none => Json.null)
   ]
 
 private def usageNat (j : Json) (key : String) : Option Nat :=
@@ -74,7 +79,7 @@ private def usageNat (j : Json) (key : String) : Option Nat :=
 public def decodeAuditEntry (j : Json) : Except DecodeError AuditEntry := do
   let o ← asObj "auditEntry" j
   exactFields "auditEntry"
-    ["runId", "kind", "providerId", "model", "stop", "usage", "file", "promptPreview"] o
+    ["runId", "kind", "providerId", "model", "stop", "usage", "file", "promptPreview", "digest"] o
   let runId ← strField "auditEntry" "runId" j
   let kind ← decodeRunKind (← strField "auditEntry" "kind" j)
   let providerId ← strField "auditEntry" "providerId" j
@@ -87,7 +92,8 @@ public def decodeAuditEntry (j : Json) : Except DecodeError AuditEntry := do
       totalTokens := usageNat usageJ "totalTokens" }
   let file ← strField "auditEntry" "file" j
   let promptPreview ← strField "auditEntry" "promptPreview" j
-  pure { runId, kind, providerId, model, stop, usage, file, promptPreview }
+  let digest ← optNullableStrField "auditEntry" "digest" j
+  pure { runId, kind, providerId, model, stop, usage, file, promptPreview, digest }
 
 /-- Append one entry to the manifest (creating it if needed). Best-effort: a
 single append syscall per run keeps interleaving unlikely, and the index is
@@ -130,7 +136,7 @@ public def rebuildIndexWith {Tool : Type} (ts : ToolSet Tool) (dir : System.File
       continue
     let raw ← IO.FS.readFile entry.path
     match decodeJsonlWith ts raw with
-    | .ok t => entries := entries.push (AuditEntry.ofTranscriptWith name t)
+    | .ok t => entries := entries.push (AuditEntry.ofTranscriptWith ts name t)
     | .error _ => pure ()   -- skip anything that is not a well-formed transcript
   let body := joinSep "\n" (entries.toList.map (fun e => Json.compress (encodeAuditEntry e)))
   let contents := if entries.isEmpty then "" else body ++ "\n"
@@ -148,7 +154,7 @@ public def writeAuditIndexedWith {Tool : Type} (ts : ToolSet Tool) (dir : System
   match ← writeAuditWith ts dir t with
   | .error e => return .error e
   | .ok path =>
-    appendIndex dir (AuditEntry.ofTranscriptWith (t.runId ++ ".jsonl") t)
+    appendIndex dir (AuditEntry.ofTranscriptWith ts (t.runId ++ ".jsonl") t)
     return .ok path
 
 public def writeAuditIndexed (dir : System.FilePath) (t : Transcript DemoTool) :
@@ -180,10 +186,19 @@ public def totalTokens (entries : Array AuditEntry) : Nat :=
   let e : AuditEntry := {
     runId := "run-1", kind := .ask, providerId := "ollama", model := "x"
     stop := .finished, usage := { totalTokens := some 20 }, file := "run-1.jsonl"
-    promptPreview := "hi"
+    promptPreview := "hi", digest := some "sha256:00"
   }
   match decodeAuditEntry (encodeAuditEntry e) with
   | .ok e2 => e2 == e
+  | .error _ => false
+
+-- A pre-digest manifest row (no `digest` key) still decodes.
+#guard
+  let legacy := "{\"runId\":\"run-1\",\"kind\":\"ask\",\"providerId\":\"ollama\",\"model\":\"x\"," ++
+    "\"stop\":{\"tag\":\"stop\",\"reason\":\"finished\"},\"usage\":{\"promptTokens\":null," ++
+    "\"completionTokens\":null,\"totalTokens\":null},\"file\":\"run-1.jsonl\",\"promptPreview\":\"hi\"}"
+  match parseJson legacy >>= decodeAuditEntry with
+  | .ok e => e.digest == none && e.runId == "run-1"
   | .error _ => false
 
 #guard

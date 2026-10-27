@@ -5,9 +5,11 @@ public import LeanAgent.Util
 public import LeanAgent.Json
 public import LeanAgent.ToolSpec
 public import LeanAgent.ToolSet
+public import LeanAgent.Samples
 public meta import LeanAgent.Json
 public meta import LeanAgent.ToolSpec
 public meta import LeanAgent.ToolSet
+public meta import LeanAgent.Samples
 
 namespace LeanAgent
 
@@ -127,6 +129,7 @@ public def assistantInvokeMessage (callId : String) (tool : DemoTool) : Message 
   | .ok (.arxivSearch "lean 4") => execute? (.arxivSearch "lean 4") == none
   | _ => false
 
+#guard kernelTools.covers (samples% DemoTool)
 #guard demoToolSpecs.size == 2
 #guard
   (demoToolSpecs.map (·.name)).toList == ["echo", "arxiv_search"]
@@ -147,6 +150,42 @@ public def assistantInvokeMessage (callId : String) (tool : DemoTool) : Message 
   match decodeDemoTool "search" (Json.mkObj [("query", Json.str "solution approach")]) with
   | .error (.invalidTag "tool" "name" "search") => true
   | _ => false
+
+/-! ## The quantified form: a decode succeeds only on a catalog name, and names its constructor -/
+
+/-- `decodeDemoTool` succeeds only on a name the catalog lists, and the tool it
+returns is the constructor that name denotes. The `decide` theorems check one
+string each; this one covers every string. -/
+public theorem decodeDemoTool_ok_name (name : String) (args : Json) (t : DemoTool)
+    (h : decodeDemoTool name args = .ok t) : toolName t = name := by
+  unfold decodeDemoTool at h
+  split at h
+  · simp only [bind, Except.bind, pure, Except.pure] at h
+    repeat' split at h
+    all_goals first | (cases h; rfl) | cases h
+  · simp only [bind, Except.bind, pure, Except.pure] at h
+    repeat' split at h
+    all_goals first | (cases h; rfl) | cases h
+  · cases h
+
+/-- So a name outside the catalog never decodes. -/
+public theorem decodeDemoTool_off_catalog (name : String) (args : Json)
+    (hn : name ≠ "echo") (hn' : name ≠ "arxiv_search") :
+    ∀ t, decodeDemoTool name args ≠ .ok t := by
+  intro t h
+  have := decodeDemoTool_ok_name name args t h
+  cases t <;> simp [toolName] at this
+  · exact hn this.symm
+  · exact hn' this.symm
+
+/-- The tagged (transcript) form: a decode succeeds only on a tag the catalog
+lists, and the tool it returns is that tag's constructor. -/
+public theorem decodeTaggedDemoTool_ok_tag (j : Json) (t : DemoTool)
+    (h : decodeTaggedDemoTool j = .ok t) : strField "tool" "tag" j = .ok (toolName t) := by
+  unfold decodeTaggedDemoTool at h
+  simp only [bind, Except.bind, pure, Except.pure] at h
+  repeat' split at h
+  all_goals first | (cases h; simp_all [toolName]) | cases h
 
 end
 

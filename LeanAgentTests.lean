@@ -14,6 +14,7 @@ import LeanAgent.AuditIndex
 import LeanAgent.Roles
 import LeanAgent.Concurrent
 import LeanAgent.Verify
+import LeanAgent.Build
 
 open LeanAgent
 
@@ -52,8 +53,148 @@ def checkImportFirewall : IO Unit := do
   assertNoForbidden "LeanAgentQuery" ⟨"LeanAgentQuery.lean"⟩
   assertNoForbidden "LeanAgentTests" ⟨"LeanAgentTests.lean"⟩
 
+/-- Builder role: the toolchain, `lake build`, `lake test` and the kernel
+re-checker, run against the two fixture packages under `fixtures/`. -/
+def builderTests : IO Unit := do
+  -- Diagnostics parse in both the `lake` and the plain `lean` spelling.
+  let lakeStyle := Build.parseDiagnostics "✖ [2/3] Building Bad\nerror: Bad.lean:4:15: Type mismatch\nerror: build failed"
+  assertTrue "lake-style diagnostic parses with file, line, column"
+    (lakeStyle.map (fun d => (d.file, d.line, d.column, d.severity)) == #[("Bad.lean", 4, 15, "error")] &&
+      lakeStyle[0]?.map (·.message) == some "Type mismatch")
+  let leanStyle := Build.parseDiagnostics "A/B.lean:10:2: warning: unused variable `x`"
+  assertTrue "lean-style diagnostic parses"
+    (leanStyle.map (fun d => (d.file, d.line, d.severity)) == #[("A/B.lean", 10, "warning")])
+  assertTrue "a build summary line is not a diagnostic"
+    ((Build.parseDiagnostics "error: build failed").isEmpty)
+  -- Targets and module names cannot smuggle flags or shell words.
+  assertTrue "module and target names are checked"
+    (Build.safeName "BuildOk.Basic" && Build.safeName "build-ok-tests" && Build.safeName "«build-ok»" &&
+      !Build.safeName "--help" && !Build.safeName "a b" && !Build.safeName "" && !Build.safeName "x;rm")
+  -- Closed catalog, every tool marked as a verification.
+  assertTrue "builder decodes lake_build"
+    (match Roles.decodeBuilder "lake_build" (Lean.Json.mkObj
+        [("project", Lean.Json.str "build-ok"), ("target", Lean.Json.str "default")]) with
+     | .ok (.lakeBuild "build-ok" "default") => true
+     | _ => false)
+  assertTrue "builder refuses file writes"
+    (match Roles.decodeBuilder "write_file" (Lean.Json.mkObj
+        [("path", Lean.Json.str "x"), ("content", Lean.Json.str "y")]) with
+     | .error (.invalidTag "tool" "name" "write_file") => true
+     | _ => false)
+  assertTrue "builder catalog is exactly the five tools"
+    ((Roles.builderSpecs.map (·.name)).toList ==
+      ["toolchain", "lake_build", "lake_test", "leanchecker", "leanchecker_paranoid"])
+  assertTrue "every builder tool is a verification, none commits"
+    ([Roles.Builder.toolchain "p", .lakeBuild "p" "t", .lakeTest "p", .leanchecker "p" "M",
+        .leancheckerParanoid "p" "M"].all (Roles.builderTools.effect · == .verify))
+  -- Runs stay inside the sandbox root.
+  let sandbox : Build.Sandbox := { root := (← IO.currentDir) / "fixtures", timeoutSecs := 600 }
+  let escaped ← Build.lakeBuild sandbox "../.." "default"
+  assertTrue "a project outside the sandbox is refused" (!escaped.ok && escaped.diagnostics.isEmpty &&
+    (escaped.output.splitOn "outside").length > 1)
+  let flagged ← Build.lakeBuild sandbox "build-ok" "--help"
+  assertTrue "a flag as target is refused" (!flagged.ok)
+  -- The real thing.
+  let version ← Build.toolchain sandbox "build-ok"
+  assertTrue "toolchain reports the pinned Lean" ((version.splitOn "v4.35.0").length > 1)
+  let good ← Build.lakeBuild sandbox "build-ok" "default"
+  assertTrue "lake_build passes on the good fixture" (good.ok && good.diagnostics.isEmpty)
+  let bad ← Build.lakeBuild sandbox "build-fail" "default"
+  assertTrue "lake_build fails on the bad fixture and points at Bad.lean line 4"
+    (!bad.ok && bad.diagnostics.any (fun d => d.file == "Bad.lean" && d.line == 4 && d.severity == "error"))
+  let tested ← Build.lakeTest sandbox "build-ok"
+  assertTrue "lake_test runs the fixture's test driver" tested.ok
+  let kernel ← Build.kernelCheck sandbox "build-ok" "BuildOk.Basic" false
+  assertTrue "leanchecker re-checks a built module" kernel.ok
+  let paranoid ← Build.kernelCheck sandbox "build-ok" "BuildOk.Basic" true
+  assertTrue "leanchecker-paranoid re-checks a built module" paranoid.ok
+  let missing ← Build.kernelCheck sandbox "build-ok" "BuildOk.Nope" false
+  assertTrue "leanchecker fails on a module that does not exist" (!missing.ok)
+  assertTrue "a verdict renders OK or FAIL with its diagnostics"
+    (good.render.startsWith "OK" && bad.render.startsWith "FAIL" && (bad.render.splitOn "Bad.lean:4").length > 1)
+
+/-- Sandbox paths: the lexical rule plus symlink confinement, and the process
+bound that needs no `timeout` binary. -/
+def sandboxTests : IO Unit := do
+  IO.FS.withTempDir fun dir => do
+    let root := dir / "root"
+    let outside := dir / "outside"
+    IO.FS.createDirAll root
+    IO.FS.createDirAll outside
+    IO.FS.writeFile (outside / "secret.txt") "secret"
+    IO.FS.writeFile (root / "inner.txt") "inner"
+    let ln (target link : System.FilePath) : IO Unit := do
+      let out ← IO.Process.output { cmd := "ln", args := #["-s", target.toString, link.toString] }
+      if out.exitCode != 0 then throw (IO.userError s!"ln failed: {out.stderr}")
+    ln outside (root / "escape")
+    ln (root / "inner.txt") (root / "self")
+    ln (outside / "new.txt") (root / "dangling")
+    assertTrue "the lexical rule accepts the path through the symlink"
+      (Files.safeRelPath "escape/secret.txt")
+    assertTrue "confine refuses a symlink out of the sandbox"
+      ((← Files.confine root "escape/secret.txt").isNone)
+    assertTrue "a symlink out of the sandbox is refused on read"
+      ((← Files.readFileIn root "escape/secret.txt").startsWith "read_file: unsafe")
+    assertTrue "a symlink out of the sandbox is refused on list"
+      ((← Files.listDirIn root "escape").startsWith "list_dir: unsafe")
+    assertTrue "a symlink out of the sandbox is refused on write"
+      ((← Files.writeFileIn root "escape/pwned.txt" "x").startsWith "write_file: unsafe")
+    assertTrue "a dangling symlink is not written through"
+      ((← Files.writeFileIn root "dangling" "x").startsWith "write_file: unsafe")
+    assertTrue "nothing was written outside the sandbox"
+      (!(← (outside / "pwned.txt").pathExists) && !(← (outside / "new.txt").pathExists))
+    assertTrue "a symlink that stays inside the sandbox still reads"
+      ((← Files.readFileIn root "self") == "inner")
+    assertTrue "a new file under a new directory still writes"
+      ((← Files.writeFileIn root "sub/new.txt" "y").startsWith "wrote" &&
+        (← IO.FS.readFile (root / "sub" / "new.txt")) == "y")
+    let sb : Build.Sandbox := { root, timeoutSecs := 10 }
+    let viaLink ← Build.lakeBuild sb "escape" "default"
+    assertTrue "a builder project reached through a symlink out of the sandbox is refused"
+      (!viaLink.ok && (viaLink.output.splitOn "outside").length > 1)
+  let (slow, timedOut) ← Verify.runBounded
+    { cmd := "sh", args := #["-c", "echo start; sleep 5; echo end"] } 1
+  assertTrue "runBounded stops a process past its deadline"
+    (timedOut && slow.stdout.contains "start" && !slow.stdout.contains "end")
+  let (quick, quickTimedOut) ← Verify.runBounded { cmd := "sh", args := #["-c", "echo done; exit 3"] } 5
+  assertTrue "runBounded returns a finished process's output and exit code"
+    (!quickTimedOut && quick.exitCode == 3 && quick.stdout.contains "done")
+  -- The process tree. A grandchild orphaned by a subshell is no longer anyone's
+  -- direct child, so a parent-based kill never reaches it; it inherits the stdout
+  -- pipe and keeps writing a heartbeat. The group kill must stop it, and the call
+  -- must return without waiting for the pipe to close.
+  IO.FS.withTempDir fun dir => do
+    let hb := dir / "heartbeat"
+    let script := s!"(while :; do date +%s > {hb}; sleep 0.2; done &); sleep 60; echo end"
+    let t0 ← IO.monoMsNow
+    let (orphaned, orphanTimedOut) ← Verify.runBounded { cmd := "sh", args := #["-c", script] } 1
+    let elapsed := (← IO.monoMsNow) - t0
+    assertTrue "runBounded returns within the deadline plus grace with an orphan on the pipe"
+      (orphanTimedOut && elapsed < 10000 && !orphaned.stdout.contains "end")
+    IO.sleep 700
+    let beat1 ← IO.FS.readFile hb
+    IO.sleep 700
+    let beat2 ← IO.FS.readFile hb
+    assertTrue "the orphaned grandchild was killed with its group" (beat1 == beat2)
+  -- A child that exits at once but leaves a descendant holding the pipe: the
+  -- call still returns, with the child's output, and the descendant is killed.
+  IO.FS.withTempDir fun dir => do
+    let hb := dir / "heartbeat"
+    let script := s!"(while :; do date +%s > {hb}; sleep 0.2; done &); echo gone"
+    let t0 ← IO.monoMsNow
+    let (left, leftTimedOut) ← Verify.runBounded { cmd := "sh", args := #["-c", script] } 1
+    let elapsed := (← IO.monoMsNow) - t0
+    assertTrue "runBounded returns when a descendant outlives an exited child"
+      (leftTimedOut && left.exitCode == 0 && left.stdout.contains "gone" && elapsed < 10000)
+    IO.sleep 700
+    let beat1 ← IO.FS.readFile hb
+    IO.sleep 700
+    let beat2 ← IO.FS.readFile hb
+    assertTrue "the descendant left behind was killed with its group" (beat1 == beat2)
+
 def main : IO UInt32 := do
   checkImportFirewall
+  sandboxTests
   let secret := "sekrit-token-value"
   let args := Curl.argv ollama.chatUrl (some "/tmp/auth.header")
   assertTrue "curl argv omits bearer secret" (!Curl.argvContains args secret)
@@ -180,7 +321,8 @@ def main : IO UInt32 := do
         (match replay t with
          | .ok out => out == "hi"
          | .error _ => false)
-      let tampered := jsonl.replace "\"output\":\"hi\"" "\"output\":\"nope\""
+      -- Replay's own check, on the pre-digest form (no header digest to trip first).
+      let tampered := (canonicalJsonl t).replace "\"output\":\"hi\"" "\"output\":\"nope\""
       assertTrue "tampered result fails replay"
         (match decodeJsonl tampered with
          | .ok t2 =>
@@ -188,6 +330,12 @@ def main : IO UInt32 := do
            | .error (.illFormed "transcript.result" _) => true
            | _ => false
          | .error _ => false)
+      -- With the digest in the header the same edit is refused before replay.
+      let tamperedDigested := jsonl.replace "\"output\":\"hi\"" "\"output\":\"nope\""
+      assertTrue "tampered result fails the digest at decode"
+        (match decodeJsonl tamperedDigested with
+         | .error (.illFormed "header.digest" "mismatch") => true
+         | _ => false)
   let shellLine :=
     "{\"tag\":\"header\",\"runId\":\"run-x\",\"kind\":\"ask\",\"prompt\":\"p\",\"providerId\":\"ollama\",\"model\":\"x\",\"toolsOffered\":[\"echo\"],\"spec\":null}\n" ++
       "{\"tag\":\"invoke\",\"callId\":\"c\",\"tool\":{\"tag\":\"shell\",\"cmd\":\"rm\"}}\n" ++
@@ -307,6 +455,30 @@ def main : IO UInt32 := do
        | .ok s => s == "theme.selection" && t.outputJson?.isSome
        | .error _ => false
      | .error _ => false)
+  assertTrue "extract-theme.jsonl is a pre-digest transcript and still decodes"
+    (match headerDigest? fixtureRaw with
+     | .ok none => true
+     | _ => false)
+  -- SHA-256 itself, against FIPS 180-4 vectors, then the digested fixture: it
+  -- pins the canonical form, so a change to the encoding is caught here.
+  assertTrue "sha256 test vectors"
+    (Sha256.hexOfString "abc" == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" &&
+      Sha256.hexOfString "" == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+  let digestedRaw ← IO.FS.readFile "fixtures/digested-ask.jsonl"
+  assertTrue "digested-ask.jsonl decodes with its digest verified and replays"
+    (match decodeJsonl digestedRaw with
+     | .ok t =>
+       (match replay t with
+        | .ok s => s == "lean"
+        | .error _ => false) &&
+         (match headerDigest? digestedRaw with
+          | .ok (some d) => d == digest t
+          | _ => false)
+     | .error _ => false)
+  assertTrue "digested-ask.jsonl pins the canonical form"
+    (match headerDigest? digestedRaw with
+     | .ok (some d) => d == "sha256:96c11ad350c7770316ad5c565e4fa33c9e3f6f9fe5daabb0add4638ddbce2a7e"
+     | _ => false)
   let observed := "http://arxiv.org/abs/2401.00001\nLean Demo\nA paper."
   let askReplies ← IO.mkRef [
     wrapToolCall "c1" "arxiv_search" "{\"query\":\"lean 4\"}",
@@ -343,6 +515,162 @@ def main : IO UInt32 := do
     (match askedBodies[1]? with
      | some b => b.contains "tool_call_id" && b.contains "Lean Demo"
      | none => false)
+  -- One loop, several calls. An OpenAI Chat turn with two calls runs both in the
+  -- model's order and posts one assistant message carrying both calls, then one
+  -- tool message per call.
+  let twoReplies ← IO.mkRef [twoEchoCalls, wrapContent "a then b"]
+  let twoBodies ← IO.mkRef (#[] : Array String)
+  let twoCalling : Completer := {
+    post := fun _url body => do
+      twoBodies.modify (·.push body)
+      match ← twoReplies.get with
+      | [] => pure (.err { body := "script exhausted" })
+      | r :: rest =>
+        twoReplies.set rest
+        pure (.ok 200 r)
+  }
+  let twoCalled ← ask twoCalling ollama "echo a and b" {} (stubArxivRunner observed) "run-two-calls"
+  let twoPosted ← twoBodies.get
+  assertTrue "a two-call turn runs both calls in order, then finishes"
+    (twoCalled.stop == .finished &&
+      twoCalled.events == #[.invoke "c1" (.echo "a"), .result "c1" "a",
+        .invoke "c2" (.echo "b"), .result "c2" "b", .finish "a then b"] &&
+      twoCalled.wellFormed &&
+      (match replay twoCalled with
+       | .ok s => s == "a then b"
+       | .error _ => false))
+  let messagesOf (body : String) : Array Lean.Json :=
+    match Lean.Json.parse body with
+    | .ok j => ((j.getObjVal? "messages").toOption.bind (·.getArr?.toOption)).getD #[]
+    | .error _ => #[]
+  let roleIs (m : Lean.Json) (role : String) : Bool :=
+    (m.getObjValAs? String "role").toOption == some role
+  assertTrue "the second request has one assistant message with both calls and a tool message per call"
+    (match twoPosted[1]? with
+     | some b =>
+       let ms := messagesOf b
+       (ms.filter (roleIs · "assistant")).size == 1 &&
+         (ms.filter (roleIs · "tool")).size == 2 &&
+         (ms.any fun m => roleIs m "assistant" &&
+           ((m.getObjVal? "tool_calls").toOption.bind (·.getArr?.toOption)).map (·.size) == some 2) &&
+         b.contains "\"tool_call_id\":\"c1\"" && b.contains "\"tool_call_id\":\"c2\""
+     | none => false)
+  -- The same turn in the Anthropic Messages protocol: two `tool_use` blocks in,
+  -- two `tool_result` blocks back.
+  let twoUses := wrapAnthropicToolUses #[("t1", "echo", "{\"text\":\"a\"}"), ("t2", "echo", "{\"text\":\"b\"}")]
+  let anthReplies ← IO.mkRef [twoUses, wrapAnthropicText "a then b"]
+  let anthBodies ← IO.mkRef (#[] : Array String)
+  let anthCalling : Completer := {
+    post := fun _url body => do
+      anthBodies.modify (·.push body)
+      match ← anthReplies.get with
+      | [] => pure (.err { body := "script exhausted" })
+      | r :: rest =>
+        anthReplies.set rest
+        pure (.ok 200 r)
+  }
+  let anthCalled ← ask anthCalling anthropic "echo a and b" {} (stubArxivRunner observed) "run-two-uses"
+  let anthPosted ← anthBodies.get
+  assertTrue "anthropic: a two-tool_use turn runs both calls in order, then finishes"
+    (anthCalled.stop == .finished &&
+      anthCalled.events == #[.invoke "t1" (.echo "a"), .result "t1" "a",
+        .invoke "t2" (.echo "b"), .result "t2" "b", .finish "a then b"] &&
+      anthCalled.wellFormed)
+  assertTrue "anthropic: the second request echoes both tool_use blocks and answers each"
+    (match anthPosted[1]? with
+     | some b =>
+       (b.splitOn "\"type\":\"tool_use\"").length == 3 &&
+         b.contains "\"tool_use_id\":\"t1\"" && b.contains "\"tool_use_id\":\"t2\"" &&
+         !b.contains "Bearer"
+     | none => false)
+  -- One invented name in a multi-call turn refuses the whole turn; the echo beside
+  -- it does not run.
+  let mixed : Completer := {
+    post := fun _url _body =>
+      pure (.ok 200 (wrapToolCalls #[("c1", "echo", "{\"text\":\"a\"}"), ("c2", "shell", "{\"cmd\":\"rm\"}")]))
+  }
+  let mixedRun ← ask mixed ollama "echo and shell" { maxTurns := 2 } (stubArxivRunner observed) "run-mixed"
+  assertTrue "a multi-call turn with an invented name refuses without running anything"
+    (mixedRun.stop == .refused 1 &&
+      mixedRun.events.all (fun e =>
+        match e with
+        | .repair _ d => d.contains "shell"
+        | _ => false))
+  -- A throwing runner is that call's result, and the turn's other call still runs.
+  let throwing : ToolRunner DemoTool := {
+    run := fun t =>
+      match t with
+      | .echo "a" => throw (IO.userError "disk on fire")
+      | .echo text => pure text
+      | .arxivSearch _ => pure observed
+  }
+  let throwReplies ← IO.mkRef [twoEchoCalls, wrapContent "coped"]
+  let throwC : Completer := {
+    post := fun _url _body => do
+      match ← throwReplies.get with
+      | [] => pure (.err { body := "script exhausted" })
+      | r :: rest =>
+        throwReplies.set rest
+        pure (.ok 200 r)
+  }
+  let coped ← ask throwC ollama "echo a and b" {} throwing "run-throwing-runner"
+  assertTrue "a throwing runner becomes that call's result and the receipt survives"
+    (coped.stop == .finished &&
+      (match coped.events[1]? with
+       | some (Event.result "c1" out) => out.contains "disk on fire" && out.startsWith "echo error"
+       | _ => false) &&
+      coped.events[3]? == some (.result "c2" "b"))
+  -- The finish gate: the first finish is nudged (a repair event, and the reply is
+  -- the next user message in the same history); the second is accepted.
+  let gateReplies ← IO.mkRef [wrapContent "early", wrapContent "final"]
+  let gateBodies ← IO.mkRef (#[] : Array String)
+  let gating : Completer := {
+    post := fun _url body => do
+      gateBodies.modify (·.push body)
+      match ← gateReplies.get with
+      | [] => pure (.err { body := "script exhausted" })
+      | r :: rest =>
+        gateReplies.set rest
+        pure (.ok 200 r)
+  }
+  let oncePolicy : AskPolicy DemoTool := {
+    onFinish := some fun info =>
+      pure (if info.nudges == 0 then .nudge "not yet" "keep going" else .accept)
+  }
+  let gated ← ask gating ollama "finish twice" oncePolicy (stubArxivRunner observed) "run-gate"
+  let gatePosted ← gateBodies.get
+  assertTrue "a nudged finish is a repair event; the next finish is accepted"
+    (gated.stop == .finished &&
+      finishText gated == some "final" &&
+      gated.events == #[.repair 1 "not yet", .finish "final"] &&
+      gated.wellFormed)
+  assertTrue "the nudge reply and the nudged finish reach the model in the same history"
+    (match gatePosted[1]? with
+     | some b => b.contains "keep going" && b.contains "early" && b.contains "finish twice"
+     | none => false)
+  let early : Completer := { post := fun _url _body => pure (.ok 200 (wrapContent "early")) }
+  let stubbornPolicy : AskPolicy DemoTool := {
+    maxTurns := 2
+    onFinish := some fun _ => pure (.nudge "not yet" "keep going")
+  }
+  let stubborn ← ask early ollama "never done" stubbornPolicy (stubArxivRunner observed) "run-stubborn"
+  assertTrue "a gate that never accepts is bounded by maxTurns and refuses"
+    (stubborn.stop == .refused 2 &&
+      stubborn.events == #[.repair 1 "not yet", .repair 2 "not yet"] &&
+      stubborn.wellFormed)
+  let crashingPolicy : AskPolicy DemoTool := {
+    onFinish := some fun _ => throw (IO.userError "gate crashed")
+  }
+  let crashed ← ask early ollama "finish" crashingPolicy (stubArxivRunner observed) "run-gate-crash"
+  assertTrue "a throwing gate refuses with a receipt"
+    (crashed.stop == .refused 1 &&
+      (lastRepairDetail crashed).map (·.contains "gate crashed") == some true)
+  let blankNudgePolicy : AskPolicy DemoTool := {
+    onFinish := some fun _ => pure (.nudge "not yet" "   ")
+  }
+  let blankNudged ← ask early ollama "finish" blankNudgePolicy (stubArxivRunner observed) "run-blank-nudge"
+  assertTrue "a blank nudge reply refuses instead of sending a blank message"
+    (blankNudged.stop == .refused 1 && lastRepairDetail blankNudged == some "blank nudge reply")
   let shelling : Completer := {
     post := fun _url _body =>
       pure (.ok 200 (wrapToolCall "c9" "shell" "{\"cmd\":\"rm\"}"))
@@ -465,12 +793,87 @@ def main : IO UInt32 := do
     (match replay reasoned with
      | .ok s => s == "Lean Demo is a relevant paper."
      | .error _ => false)
-  -- Reasoning is a trace, never fed back to the model as an input turn.
+  -- Reasoning is a trace, never fed back to the model as an input turn: in a
+  -- two-turn run the second request body carries the tool call and its result
+  -- but not the first turn's reasoning.
+  let thought := "I should search arXiv before answering."
+  let toolCallWithReasoning := Lean.Json.compress (Lean.Json.mkObj [
+    ("choices", Lean.Json.arr #[Lean.Json.mkObj [
+      ("finish_reason", Lean.Json.str "tool_calls"),
+      ("message", Lean.Json.mkObj [
+        ("role", Lean.Json.str "assistant"),
+        ("content", Lean.Json.null),
+        ("reasoning_content", Lean.Json.str thought),
+        ("tool_calls", Lean.Json.arr #[Lean.Json.mkObj [
+          ("id", Lean.Json.str "c1"),
+          ("type", Lean.Json.str "function"),
+          ("function", Lean.Json.mkObj [
+            ("name", Lean.Json.str "arxiv_search"),
+            ("arguments", Lean.Json.str "{\"query\":\"lean 4\"}")
+          ])
+        ]])
+      ])
+    ]])
+  ])
+  let twoTurnReplies ← IO.mkRef [toolCallWithReasoning, wrapContent "Lean Demo is relevant."]
+  let twoTurnBodies ← IO.mkRef (#[] : Array String)
+  let twoTurnCompleter : Completer := {
+    post := fun _url body => do
+      twoTurnBodies.modify (·.push body)
+      match ← twoTurnReplies.get with
+      | [] => pure (.err { body := "script exhausted" })
+      | r :: rest =>
+        twoTurnReplies.set rest
+        pure (.ok 200 r)
+  }
+  let twoTurn ← ask twoTurnCompleter ollama "find lean 4 papers" {}
+    (stubArxivRunner observed) "run-reasoning-2"
+  let twoTurnPosted ← twoTurnBodies.get
+  assertTrue "reasoning before a tool call is recorded"
+    (twoTurn.stop == .finished &&
+      twoTurn.events.any (fun e =>
+        match e with
+        | .reasoning 1 c => c == thought
+        | _ => false))
   assertTrue "reasoning is not sent back to the provider"
-    (reasoned.events.foldl (init := true) fun ok e =>
-      match e with
-      | .reasoning _ _ => ok
-      | _ => ok)
+    (twoTurnPosted.size == 2 &&
+      (match twoTurnPosted[1]? with
+       | some b => b.contains "Lean Demo" && b.contains "tool_call_id" && !b.contains thought
+       | none => false))
+  -- A runner that throws does not lose the receipt: the exception is the tool's
+  -- result, the loop goes on, and the transcript still writes.
+  let throwingRunner : ToolRunner DemoTool := {
+    run := fun t =>
+      match t with
+      | .echo text => pure text
+      | .arxivSearch _ => throw (IO.userError "arxiv exploded")
+  }
+  let throwReplies ← IO.mkRef [
+    wrapToolCall "c1" "arxiv_search" "{\"query\":\"lean 4\"}",
+    wrapContent "The search failed, so I cannot cite a paper."
+  ]
+  let throwingCompleter : Completer := {
+    post := fun _url _body => do
+      match ← throwReplies.get with
+      | [] => pure (.err { body := "script exhausted" })
+      | r :: rest =>
+        throwReplies.set rest
+        pure (.ok 200 r)
+  }
+  let thrown ← ask throwingCompleter ollama "find lean 4 papers" {} throwingRunner "run-throw"
+  assertTrue "a throwing runner becomes a tool-error result"
+    (thrown.stop == .finished &&
+      thrown.events.any (fun e =>
+        match e with
+        | .result "c1" out => out.contains "arxiv_search error" && out.contains "arxiv exploded"
+        | _ => false))
+  IO.FS.withTempDir fun dir => do
+    match ← writeAudit dir thrown with
+    | .error _ => assertTrue "write audit after a throwing runner" false
+    | .ok path => do
+        let raw ← IO.FS.readFile path
+        assertTrue "audit after a throwing runner carries the error"
+          (raw.contains "arxiv exploded" && raw.contains "\"reason\":\"finished\"")
   IO.FS.withTempDir fun dir => do
     match ← writeAudit dir reasoned with
     | .error _ => assertTrue "write reasoning audit" false
@@ -478,6 +881,74 @@ def main : IO UInt32 := do
         let raw ← IO.FS.readFile path
         assertTrue "persisted audit carries the model reasoning"
           (raw.contains "answer directly" && raw.contains "\"tag\":\"reasoning\"")
+        -- Content digest: the written audit round-trips with its digest verified,
+        -- and an edit to model free text (finish or reasoning) in the file is
+        -- refused by the decoder, which replay alone could not detect.
+        assertTrue "written audit carries a sha256 content digest"
+          (match headerDigest? raw with
+           | .ok (some d) => d == digest reasoned && d.startsWith "sha256:" && d.length == 7 + 64
+           | _ => false)
+        assertTrue "written audit decodes with its digest verified"
+          (match decodeJsonl raw with
+           | .ok t2 => t2.events == reasoned.events && digest t2 == digest reasoned
+           | .error _ => false)
+        let forgedFinish := raw.replace "Lean Demo is a relevant paper." "Lean Demo is not relevant."
+        IO.FS.writeFile path forgedFinish
+        let reread ← IO.FS.readFile path
+        assertTrue "an edited finish line in the audit file is refused"
+          (reread != raw &&
+            (match decodeJsonl reread with
+             | .error (.illFormed "header.digest" "mismatch") => true
+             | _ => false))
+        let forgedReasoning := raw.replace "answer directly" "answer later"
+        assertTrue "an edited reasoning line is refused"
+          (forgedReasoning != raw &&
+            (match decodeJsonl forgedReasoning with
+             | .error (.illFormed "header.digest" "mismatch") => true
+             | _ => false))
+        let badAlgo := raw.replace "\"digest\":\"sha256:" "\"digest\":\"md5:"
+        assertTrue "an unknown digest algorithm is refused"
+          (match decodeJsonl badAlgo with
+           | .error (.illFormed "header.digest" "unsupported algorithm") => true
+           | _ => false)
+        -- Stripping the digest yields the pre-digest form, which still decodes
+        -- under the default policy and is refused under `.require`: so is a file
+        -- whose finish was edited and whose digest was then deleted.
+        assertTrue "the canonical (pre-digest) form still decodes"
+          (match decodeJsonl (canonicalJsonl reasoned) with
+           | .ok t2 => t2.events == reasoned.events
+           | .error _ => false)
+        assertTrue "a missing digest is refused when one is required"
+          (match decodeJsonl (canonicalJsonl reasoned) .require with
+           | .error (.illFormed "header.digest" "missing") => true
+           | _ => false)
+        let stripped := forgedFinish.replace ("\"digest\":\"" ++ digest reasoned ++ "\",") ""
+        assertTrue "an edited finish with the digest deleted is refused when one is required"
+          (!stripped.contains "digest" &&
+            (match decodeJsonl stripped .require with
+             | .error (.illFormed "header.digest" "missing") => true
+             | _ => false))
+        assertTrue "a present digest is still verified when one is required"
+          (match decodeJsonl raw .require with
+           | .ok t2 => t2.events == reasoned.events
+           | .error _ => false)
+        -- The usage object is under the same fail-closed rule as the header:
+        -- a key or value the encoder never writes is refused, not ignored.
+        let header := (jsonlLines raw).head!
+        let withUsage (u : String) : String :=
+          raw.replace header (header.replace "\"spec\":null" ("\"spec\":null,\"usage\":" ++ u))
+        assertTrue "a usage object with an unknown key is refused"
+          (match decodeJsonl (withUsage "{\"note\":\"edited\"}") with
+           | .error (.unknownFields "header.usage" ["note"]) => true
+           | _ => false)
+        assertTrue "a usage value that is not an object is refused"
+          (match decodeJsonl (withUsage "\"hello\"") with
+           | .error (.expectedObject "header.usage") => true
+           | _ => false)
+        assertTrue "a usage count that is not a number is refused"
+          (match decodeJsonl (withUsage "{\"promptTokens\":\"12\"}") with
+           | .error (.wrongType "header.usage" "promptTokens" _) => true
+           | _ => false)
   -- Token usage: parsed from the provider envelope, summed over turns, persisted.
   let usageReply :=
     "{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\"," ++
@@ -526,7 +997,8 @@ def main : IO UInt32 := do
           (idx.size == 1 &&
             (match idx[0]? with
              | some e => e.runId == usaged.runId && e.usage.totalTokens == some 20 &&
-                 e.providerId == "ollama" && AuditEntry.finished e
+                 e.providerId == "ollama" && AuditEntry.finished e &&
+                 e.digest == some (digest usaged)
              | none => false))
     -- Add a second, refused run, then rebuild the index purely from transcripts.
     match ← writeAuditIndexed dir invented2 with
@@ -535,6 +1007,8 @@ def main : IO UInt32 := do
         let rebuilt ← rebuildIndex dir
         assertTrue "rebuild reconstructs the index from transcripts"
           (rebuilt.size == 2)
+        assertTrue "rebuilt index rows carry the transcript digests"
+          (rebuilt.all fun e => e.digest.isSome)
         assertTrue "query: exactly one refused run"
           ((refusedRuns rebuilt).size == 1)
         assertTrue "query: both runs are on ollama"
@@ -577,5 +1051,6 @@ def main : IO UInt32 := do
   assertTrue "leanCheck accepts a well-typed snippet" goodV.ok
   let badV ← Verify.leanCheck "def n : Nat := \"nope\"" 60
   assertTrue "leanCheck rejects an ill-typed snippet" (!badV.ok)
+  builderTests
   IO.println "lean-agent tests passed"
   return 0

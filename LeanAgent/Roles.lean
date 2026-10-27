@@ -6,14 +6,17 @@ public import LeanAgent.Json
 public import LeanAgent.ToolSpec
 public import LeanAgent.ToolSet
 public import LeanAgent.ToolDSL
+public import LeanAgent.Samples
 public import LeanAgent.Arxiv
 public import LeanAgent.WebSearch
 public import LeanAgent.Files
 public import LeanAgent.Verify
+public import LeanAgent.Build
 public meta import LeanAgent.Json
 public meta import LeanAgent.ToolSpec
 public meta import LeanAgent.ToolSet
 public meta import LeanAgent.ToolDSL
+public meta import LeanAgent.Samples
 
 /-!
 Role-specific closed tool catalogs. Each role owns its own closed `Tool`
@@ -140,6 +143,46 @@ public def verifierRunner (timeoutSecs : Nat := 30) : ToolRunner Verifier := {
       pure v.render
 }
 
+/-! ## Builder: toolchain, lake build/test, kernel re-check (no writes, no git) -/
+
+public inductive Builder where
+  | toolchain (project : String)
+  | lakeBuild (project target : String)
+  | lakeTest (project : String)
+  | leanchecker (project module : String)
+  | leancheckerParanoid (project module : String)
+  deriving Repr, BEq
+
+public def builderTools : ToolSet Builder := mkToolSet [
+  { toolDecl1 "toolchain"
+      "Report the Lean toolchain a project pins and the one it actually runs. `project` is a path in the sandbox, `.` for its root."
+      "project" Builder.toolchain (fun | .toolchain p => some p | _ => none) with effect := .verify },
+  { toolDecl2 "lake_build"
+      "Run `lake build` in a sandbox project. `target` is a lake target, or `default` for the default targets. Returns OK, or FAIL with file:line:column diagnostics."
+      "project" "target" Builder.lakeBuild (fun | .lakeBuild p t => some (p, t) | _ => none) with effect := .verify },
+  { toolDecl1 "lake_test"
+      "Run `lake test` (the project's test driver) in a sandbox project. Returns OK, or FAIL with diagnostics and the end of the output."
+      "project" Builder.lakeTest (fun | .lakeTest p => some p | _ => none) with effect := .verify },
+  { toolDecl2 "leanchecker"
+      "Re-check a built module's declarations with the Lean kernel (`leanchecker`). Build the project first."
+      "project" "module" Builder.leanchecker (fun | .leanchecker p m => some (p, m) | _ => none) with effect := .verify },
+  { toolDecl2 "leanchecker_paranoid"
+      "Like `leanchecker`, with the stricter `leanchecker-paranoid` re-check."
+      "project" "module" Builder.leancheckerParanoid (fun | .leancheckerParanoid p m => some (p, m) | _ => none) with effect := .verify }
+]
+
+public def builderSpecs : Array ToolSpec := builderTools.specs
+public def decodeBuilder : String → Json → Except DecodeError Builder := builderTools.decode
+
+public def builderRunner (sandbox : Build.Sandbox) : ToolRunner Builder := {
+  run := fun
+    | .toolchain p => Build.toolchain sandbox p
+    | .lakeBuild p t => return (← Build.lakeBuild sandbox p t).render
+    | .lakeTest p => return (← Build.lakeTest sandbox p).render
+    | .leanchecker p m => return (← Build.kernelCheck sandbox p m false).render
+    | .leancheckerParanoid p m => return (← Build.kernelCheck sandbox p m true).render
+}
+
 /-! Refusal is structural: an off-catalog name cannot inhabit a role's tool. -/
 
 #guard
@@ -172,9 +215,23 @@ public def verifierRunner (timeoutSecs : Nat := 30) : ToolRunner Verifier := {
   | .error (.invalidTag "tool" "name" "web_search") => true
   | _ => false
 
+/-! Each catalog covers its inductive. The sample list is `samples%`, one value
+per constructor generated from the inductive, so a constructor added to a role
+is in the check the moment it is declared, not when someone remembers to list it. -/
+
+#guard academicTools.covers (samples% Academic)
+#guard marketTools.covers (samples% Market)
+#guard readerTools.covers (samples% Reader)
+#guard writerTools.covers (samples% Writer)
+#guard verifierTools.covers (samples% Verifier)
+#guard builderTools.covers (samples% Builder)
+#guard (samples% Builder).length == 5
+
 #guard (readerSpecs.map (·.name)).toList == ["read_file", "list_dir"]
 #guard (writerSpecs.map (·.name)).toList == ["read_file", "write_file"]
 #guard (verifierSpecs.map (·.name)).toList == ["lean_check"]
+#guard (builderSpecs.map (·.name)).toList ==
+  ["toolchain", "lake_build", "lake_test", "leanchecker", "leanchecker_paranoid"]
 
 end
 

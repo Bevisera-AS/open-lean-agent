@@ -30,7 +30,7 @@ public structure Agent (Tool : Type) where
   cfg : ProviderConfig
   tools : ToolSet Tool
   runner : ToolRunner Tool
-  policy : AskPolicy := {}
+  policy : AskPolicy Tool := {}
 
 /-- Run an agent on a prompt, producing an audited transcript. `c` is the model
 seam (`curlCompleter cfg` live, or a scripted `Completer` in tests). -/

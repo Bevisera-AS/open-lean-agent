@@ -1,0 +1,3 @@
+#!/bin/sh
+# The hermetic workspace's program is prog.sh: nothing to compile.
+[ -f prog.sh ] || { echo "no prog.sh"; exit 1; }

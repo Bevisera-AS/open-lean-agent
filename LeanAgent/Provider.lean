@@ -128,6 +128,18 @@ public def Config.overlay {p : Provider} (c : Config p) (model? url? : Option St
   | .glm s =>
     .glm { s with model := pickNonempty s.model model?, baseUrl := pickNonempty s.baseUrl url? }
 
+/-- Replace the output cap; `none` keeps the provider's. A reasoning model spends
+the cap on its reasoning, so the default `some 1024` truncates its answers. -/
+public def Config.withMaxTokens {p : Provider} (c : Config p) : Option Nat → Config p
+  | none => c
+  | some n =>
+    match c with
+    | .ollama s => .ollama { s with maxTokens := some n }
+    | .bedrockMantle s => .bedrockMantle { s with maxTokens := some n }
+    | .openAI s => .openAI { s with maxTokens := some n }
+    | .anthropic s => .anthropic { s with maxTokens := some n }
+    | .glm s => .glm { s with maxTokens := some n }
+
 public def ProviderConfig.model (c : ProviderConfig) : String :=
   Config.model c.config
 
@@ -252,6 +264,8 @@ public def ProviderConfig.authHeader (c : ProviderConfig) : AuthHeader :=
   | .ok c => c.providerId == "openai" && c.chatUrl.endsWith "/chat/completions"
   | .error _ => false
 #guard Config.apiKeyEnv (.ollama { baseUrl := "http://127.0.0.1:11434/v1", model := "x" }) == none
+#guard (glm.config.withMaxTokens (some 32768)).maxTokens == some 32768
+#guard (glm.config.withMaxTokens none).maxTokens == some 1024
 
 end
 

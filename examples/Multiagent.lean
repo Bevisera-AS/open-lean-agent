@@ -52,8 +52,6 @@ def encodeBrief (b : MarketBrief) : Json :=
   ]
 
 def decodeBrief (j : Json) : Except DecodeError MarketBrief := do
-  let o ← asObj "market_brief" j
-  exactFields "market_brief" ["topic", "marketSizeUsd", "competitors"] o
   let topic ← strField "market_brief" "topic" j
   let size ← natField "market_brief" "marketSizeUsd" j
   let competitors ← arrStrField "market_brief" "competitors" j
@@ -61,27 +59,27 @@ def decodeBrief (j : Json) : Except DecodeError MarketBrief := do
   else .error (.illFormed "market_brief.topic" "blank")
 
 /-- The contract ties the JSON schema, the Lean decode/encode, and the
-well-formedness predicate together. -/
-def marketBrief : OutputContract MarketBrief := {
-  name := "market_brief"
-  schema := Json.mkObj [
-    ("type", Json.str "object"),
-    ("properties", Json.mkObj [
+well-formedness predicate together. One field list yields the schema and the
+decoder's unknown-field check. -/
+def marketBrief : OutputContract MarketBrief :=
+  OutputContract.ofFields "market_brief" [
       ("topic", Json.mkObj [("type", Json.str "string")]),
       ("marketSizeUsd", Json.mkObj [("type", Json.str "integer")]),
       ("competitors", Json.mkObj [
         ("type", Json.str "array"),
         ("items", Json.mkObj [("type", Json.str "string")])
       ])
-    ]),
-    ("required", Json.arr #[Json.str "topic", Json.str "marketSizeUsd", Json.str "competitors"]),
-    ("additionalProperties", Json.bool false)
-  ]
-  decode := decodeBrief
-  encode := encodeBrief
-  wellFormed := fun b => nonemptyText b.topic && b.competitors.size > 0
-  repairHint := defaultRepairHint "market_brief"
-}
+    ]
+    decodeBrief encodeBrief (fun b => nonemptyText b.topic && b.competitors.size > 0)
+
+#guard marketBrief.roundTrips
+  [{ topic := "lean provers", marketSizeUsd := 42, competitors := #["Coq", "Isabelle"] }]
+#guard marketBrief.schemaAgrees ["topic", "marketSizeUsd", "competitors"]
+#guard
+  match marketBrief.accept (Json.mkObj [("topic", Json.str "t"), ("marketSizeUsd", (1 : Json)),
+      ("competitors", Json.arr #[Json.str "c"]), ("extra", Json.str "x")]) with
+  | .error (.unknownFields "market_brief" ["extra"]) => true
+  | _ => false
 
 /-- Render a `MarketBrief` into a prompt for the academic agent. Type-checked
 handoff: the downstream prompt is derived from the Lean value's fields. -/
