@@ -9,7 +9,7 @@ suite (`lake test`), with no `sorry` and no `native_decide`. From 0.2.0,
 `lake check --paranoid` accepts the library with only the three standard
 axioms (`propext`, `Quot.sound`, `Classical.choice`).
 
-## [Unreleased]
+## [0.4.0] — 2026-10-29
 
 ### Added
 - **Transcript content digest** (`LeanAgent/Sha256.lean`, `LeanAgent/Transcript.lean`).
