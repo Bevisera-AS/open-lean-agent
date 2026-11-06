@@ -40,6 +40,10 @@ public structure HostedSettings where
   model : String
   apiKeyEnv : String
   maxTokens : Option Nat := some 1024
+  /-- Extended-thinking budget in tokens. Only the Anthropic encoder sends it, as
+  `thinking: {type: "enabled", budget_tokens}`; the Messages API requires
+  `max_tokens` above it. The other hosted providers reason server-side and ignore it. -/
+  thinkingBudget : Option Nat := none
   deriving Repr, BEq
 
 /-- Provider-indexed settings. Ollama cannot carry an API-key env; hosted providers must. -/
@@ -140,6 +144,24 @@ public def Config.withMaxTokens {p : Provider} (c : Config p) : Option Nat → C
     | .anthropic s => .anthropic { s with maxTokens := some n }
     | .glm s => .glm { s with maxTokens := some n }
 
+public def Config.thinkingBudget {p : Provider} : Config p → Option Nat
+  | .ollama _ => none
+  | .bedrockMantle s => s.thinkingBudget
+  | .openAI s => s.thinkingBudget
+  | .anthropic s => s.thinkingBudget
+  | .glm s => s.thinkingBudget
+
+/-- Set the extended-thinking budget; `none` keeps the provider's. Ollama carries none. -/
+public def Config.withThinkingBudget {p : Provider} (c : Config p) : Option Nat → Config p
+  | none => c
+  | some n =>
+    match c with
+    | .ollama s => .ollama s
+    | .bedrockMantle s => .bedrockMantle { s with thinkingBudget := some n }
+    | .openAI s => .openAI { s with thinkingBudget := some n }
+    | .anthropic s => .anthropic { s with thinkingBudget := some n }
+    | .glm s => .glm { s with thinkingBudget := some n }
+
 public def ProviderConfig.model (c : ProviderConfig) : String :=
   Config.model c.config
 
@@ -148,6 +170,9 @@ public def ProviderConfig.baseUrl (c : ProviderConfig) : String :=
 
 public def ProviderConfig.maxTokens (c : ProviderConfig) : Option Nat :=
   Config.maxTokens c.config
+
+public def ProviderConfig.thinkingBudget (c : ProviderConfig) : Option Nat :=
+  Config.thinkingBudget c.config
 
 public def ProviderConfig.apiKeyEnv (c : ProviderConfig) : Option String :=
   Config.apiKeyEnv c.config
@@ -266,6 +291,10 @@ public def ProviderConfig.authHeader (c : ProviderConfig) : AuthHeader :=
 #guard Config.apiKeyEnv (.ollama { baseUrl := "http://127.0.0.1:11434/v1", model := "x" }) == none
 #guard (glm.config.withMaxTokens (some 32768)).maxTokens == some 32768
 #guard (glm.config.withMaxTokens none).maxTokens == some 1024
+#guard anthropic.thinkingBudget == none
+#guard (anthropic.config.withThinkingBudget (some 2048)).thinkingBudget == some 2048
+#guard (anthropic.config.withThinkingBudget none).thinkingBudget == none
+#guard (ollama.config.withThinkingBudget (some 2048)).thinkingBudget == none
 
 end
 

@@ -193,8 +193,10 @@ receipt. Fatal transport does not retry; retryable 429/5xx retries until
 turn with several tool calls runs them in order: one assistant message carrying
 every call, one `invoke`/`result` pair and one tool message per call. A throwing
 runner becomes that call's result, not a lost transcript. A finish passes the
-kernel checks and then `policy.onFinish`, which may nudge instead. The caller owns
-the closed tool set. -/
+kernel checks and then `policy.onFinish`, which may nudge instead. An assistant turn
+goes back to the model as it was produced (`completionReplayBlocks`): for Anthropic
+that carries the signed thinking its tool calls rest on. The caller owns the closed
+tool set. -/
 public def askWith {Tool : Type} (tools : ToolSet Tool) (system : String)
     (c : Completer) (cfg : ProviderConfig) (prompt : String)
     (policy : AskPolicy Tool := {}) (runner : ToolRunner Tool)
@@ -254,6 +256,7 @@ public def askWith {Tool : Type} (tools : ToolSet Tool) (system : String)
             match completionReasoning raw cfg.protocol with
             | some r => events.push (.reasoning (turn + 1) r)
             | none => events
+          let replay := completionReplayBlocks raw cfg.protocol
           match turnFromCompletionWith tools raw cfg.protocol with
           | .error e => refused events usage e.pretty
           | .ok (.finish content) =>
@@ -272,8 +275,8 @@ public def askWith {Tool : Type} (tools : ToolSet Tool) (system : String)
                 if isLastAttempt turn policy.maxTurns then
                   pure (.done (mk events (.refused (turn + 1)) usage))
                 else
-                  pure (.more (msgs.push { role := .assistant, content } |>.push repairMsg,
-                    events, usage, nudges))
+                  pure (.more (msgs.push { role := .assistant, content, contentBlocksJson? := replay }
+                    |>.push repairMsg, events, usage, nudges))
               | none =>
                 -- Then the caller's gate, if any.
                 match policy.onFinish with
@@ -292,23 +295,24 @@ public def askWith {Tool : Type} (tools : ToolSet Tool) (system : String)
                       if isLastAttempt turn policy.maxTurns then
                         pure (.done (mk events (.refused (turn + 1)) usage))
                       else
-                        pure (.more (msgs.push { role := .assistant, content }
+                        pure (.more (msgs.push { role := .assistant, content, contentBlocksJson? := replay }
                           |>.push { role := .user, content := reply }, events, usage, nudges + 1))
           | .ok (.invoke calls) =>
             if calls.any (fun (callId, _) => !nonemptyText callId) then
               refused events usage "blank callId"
             else
-              -- Every call of the turn, in the model's order, each answered under its
-              -- own call id. A runner that throws must not lose the receipt: the
-              -- exception becomes that call's result, on the record and visible to
-              -- the model, and the loop goes on.
-              let mut events := events
-              let mut msgs := msgs.push (tools.assistantInvokesMessage calls)
-              for (callId, tool) in calls do
-                let output ← try runner.run tool catch e =>
-                  pure s!"{tools.name tool} error: {e}"
-                events := events ++ #[.invoke callId tool, .result callId output]
-                msgs := msgs.push (toolResultMessage callId output)
+              -- Every call of the turn runs in the model's order. A runner that throws
+              -- must not lose the receipt: the exception becomes that call's output, on
+              -- the record and visible to the model, and the loop goes on. What is
+              -- recorded and what answers the model are `turnEvents` and
+              -- `turnResultMessages` of those outputs: pure, with one invoke and one
+              -- result per call, under its own id, as theorems.
+              let outputs ← calls.mapM fun (_, tool) =>
+                try runner.run tool catch e => pure s!"{tools.name tool} error: {e}"
+              let events := events ++ turnEvents calls outputs
+              let msgs :=
+                msgs.push { tools.assistantInvokesMessage calls with contentBlocksJson? := replay } ++
+                  turnResultMessages calls outputs
               pure (.more (msgs, events, usage, nudges))
 
 public def ask (c : Completer) (cfg : ProviderConfig) (prompt : String)

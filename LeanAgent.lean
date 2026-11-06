@@ -22,6 +22,11 @@ public import LeanAgent.Provider
 public import LeanAgent.Retry
 public import LeanAgent.Roles
 public import LeanAgent.Samples
+public import LeanAgent.Semantics.Authority
+public import LeanAgent.Semantics.Example
+public import LeanAgent.Semantics.FLTS
+public import LeanAgent.Semantics.Invariant
+public import LeanAgent.Semantics.LTS
 public import LeanAgent.Sha256
 public import LeanAgent.Step
 public import LeanAgent.ToolDSL

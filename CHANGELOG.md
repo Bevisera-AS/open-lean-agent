@@ -9,7 +9,82 @@ suite (`lake test`), with no `sorry` and no `native_decide`. From 0.2.0,
 `lake check --paranoid` accepts the library with only the three standard
 axioms (`propext`, `Quot.sound`, `Classical.choice`).
 
-## [0.4.0] — 2026-10-29
+## [Unreleased]
+
+## [0.5.0] — 2026-11-06
+
+### Added
+- **Agent authority** (`LeanAgent/Semantics/Authority.lean`). Rules about what agents
+  may do, for any transition system whose labels record the actor (`Acted`).
+  `AgentStepsLandIn`: if every agent step lands in an allowed set, an agent-only run
+  ends where it started or in that set (`AgentStepsLandIn.mtr`), and every run into
+  a goal outside it, such as `accepted`, contains a human step (`humanStep_of_reach`,
+  `agentRun_avoids`). `AgentNeverDoes`: an act agents never take appears in no
+  agent-only run. `Budgeted`: if every step lowers a fuel measure, no run is longer
+  than the starting fuel (`Budgeted.length_le`). The worked example adds a governed
+  lifecycle where only a human accepts, a counter-model without the actor check
+  (`ungoverned_fails`), and a turn-bounded loop.
+- **Transition systems** (`LeanAgent/Semantics/`). A shared backbone for rules about
+  agents, lifecycles and message loops, adapted from CSLib without Mathlib.
+  `LTS` (with `ofPartial` for status tables), runs `MTr` that split and join
+  (`MTr.append_iff`), `CanReach`, `IsTrace`, `IsTerminal`. `Invariant.lean`:
+  a rule kept by every step is kept by every run (`TrInv.mtrInv`, `TrInv.canReach`);
+  the same for runs of allowed labels only (`TrInvOn.mtr`, the frame rule); and gates,
+  where the only steps into a set carry a key label, so every run into it contains
+  the key (`EntersOnlyVia.mtr`). `FLTS.lean`: functional systems (an Elm-style
+  `update`), whose fold agrees with the relational view (`toLTS_mtr_iff`), with the
+  frame rule `Preserves.mtr`. `Example.lean`: a proposal lifecycle where `accepted`
+  is reached only through `accept`, with `sloppy_fails` showing the gate rejects a
+  wrong table. Proofs use only the standard axioms.
+- **Anthropic thinking replay** (`LeanAgent/Anthropic.lean`, `LeanAgent/Types.lean`,
+  `LeanAgent/Ask.lean`). `Message.contentBlocksJson?` keeps an assistant turn's content
+  blocks as the provider returned them, and the Anthropic encoder replays them verbatim,
+  so the signed `thinking` and `redacted_thinking` blocks a tool-calling turn rests on
+  reach the model again, in order and with their text unmerged, as the Messages API
+  requires. `completionReplayBlocks` fills the field in `askWith` for every assistant
+  turn (tool calls, and finishes a cite repair or a finish gate continues from);
+  `anthropicReplayableBlock` keeps only the four block types the API hands back and
+  accepts, dropping empty text. The OpenAI encoder ignores the field. The audit
+  `reasoning` event is unchanged and never carries a signature. The design follows
+  Paul Butcher's [lean-llmclient](https://github.com/paulbutcher/lean-llmclient).
+- **A turn's bookkeeping as pure functions** (`LeanAgent/Transcript.lean`,
+  `LeanAgent/Ask.lean`). `turnEventList` / `turnEvents` and `turnResultMessageList` /
+  `turnResultMessages` are what `askWith` records and sends back for a turn's calls and
+  their outputs; the loop only runs the calls in order and supplies one output each.
+  Theorems: `turnEventList_invokes` and `turnEventList_results` (every call invoked
+  once and answered once, under its own id and output, in the model's order),
+  `turnEventList_eventsGo` (`eventsGo_pair` for a turn of any length) and
+  `turnEvents_wellFormed` (a turn plus a finish is a well-formed record). `invokedIds`
+  and `recordedResults` read the ids and results off an event list.
+- **Anthropic tool results batched** (`LeanAgent/Anthropic.lean`). `anthropicMessageList`
+  encodes a history as the Messages API wants it: a run of consecutive tool messages
+  becomes one user message carrying one `tool_result` block per call, in order, rather
+  than one user message per result that relied on the API merging consecutive turns.
+  `anthropicRequest` uses it. Theorems: `anthropicMessagesGo_batches` and
+  `anthropicMessageList_batches` (the results answering any turn go out as one message
+  right after it, with everything before encoded as it would be alone) and, joined with
+  the turn bookkeeping, `anthropicMessageList_turn` (one `tool_result` per call, under
+  the call's id and output). `anthropicToolResultBlock`, `anthropicToolResultBlockOf`
+  and `anthropicUserMessage` are the pieces; `toolResultMessage` is now `@[expose]`.
+- **The storage round trip, for every value** (`LeanAgent/Theorems.lean`).
+  `decodeEvent_encodeEvent`: every transcript event decodes to itself, for every call
+  id, output, detail, attempt and turn, given only `Event.decodable`, that a reasoning
+  line and an invoked tool's payload are not blank, which the decoders refuse.
+  `decodeStop_encodeStop` and `decodeTaggedDemoTool_encodeDemoTool` likewise. The object
+  maps have fixed keys, so each proof is `rfl`. `DemoTool.payload` and `Event.decodable`
+  name the condition. The fixture-level round trips stay as they were.
+- **Extended-thinking budget** (`LeanAgent/Provider.lean`, `LeanAgent/Live.lean`).
+  `HostedSettings.thinkingBudget`, `Config.withThinkingBudget` and
+  `ProviderConfig.thinkingBudget`; the Anthropic request carries
+  `thinking: {type: "enabled", budget_tokens}` when set, and `LEAN_AGENT_THINKING_BUDGET`
+  sets it from the environment. Ollama carries none.
+- Test envelopes `wrapAnthropicMessage`, `anthropicTextBlock`, `anthropicThinkingBlock`,
+  `anthropicToolUseBlock` and `wrapAnthropicThinkingToolUses`; `wrapAnthropicThinking`
+  now writes a signature, as the API does.
+
+## [0.3.0]–[0.4.0] — 2026-10-20 to 2026-10-29
+
+Released as two tags without separate changelog sections; listed together.
 
 ### Added
 - **Transcript content digest** (`LeanAgent/Sha256.lean`, `LeanAgent/Transcript.lean`).

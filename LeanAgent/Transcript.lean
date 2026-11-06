@@ -58,6 +58,16 @@ public inductive Event (Tool : Type := DemoTool) where
   | finish (content : String)
   deriving Repr, BEq
 
+/-- What the decoder requires of an event beyond its shape: a reasoning line is not
+blank, and neither is the payload of an invoked tool. Every other event decodes as
+written. `decodeEvent_encodeEvent` is the round trip under this condition. -/
+public def Event.decodable : Event DemoTool → Bool
+  | .invoke _ tool => nonemptyText tool.payload
+  | .reasoning _ content => nonemptyText content
+  | .result _ _ => true
+  | .repair _ _ => true
+  | .finish _ => true
+
 @[expose] public def safeRunId (s : String) : Bool :=
   nonemptyText s && s.toList.all fun c => c.isAlphanum || c == '-'
 
@@ -150,6 +160,138 @@ public def Transcript.eventsMatchStop {Tool : Type} (t : Transcript Tool) : Bool
     match t.events.back? with
     | some (.repair _ _) => true
     | _ => false
+
+/-! ## A turn's bookkeeping, as pure functions
+
+`askWith` runs every call of a turn in order and supplies one output per call; what
+it records and what it sends back are these functions of the calls and their
+outputs, so the per-call contract is a theorem about them rather than a property
+of an `IO` loop. -/
+
+/-- The events of a turn: `invoke` then `result` per call, in the model's order. -/
+public def turnEventList {Tool : Type} : List ((String × Tool) × String) → List (Event Tool)
+  | [] => []
+  | ((callId, tool), output) :: rest =>
+    .invoke callId tool :: .result callId output :: turnEventList rest
+
+/-- The tool messages answering a turn, one per call, in the model's order. -/
+public def turnResultMessageList {Tool : Type} (pairs : List ((String × Tool) × String)) :
+    List Message :=
+  pairs.map fun ((callId, _), output) => toolResultMessage callId output
+
+/-- `calls` answered by `outputs`, position by position. -/
+public def turnPairs {Tool : Type} (calls : Array (String × Tool)) (outputs : Array String) :
+    List ((String × Tool) × String) :=
+  (calls.zip outputs).toList
+
+public def turnEvents {Tool : Type} (calls : Array (String × Tool)) (outputs : Array String) :
+    Array (Event Tool) :=
+  (turnEventList (turnPairs calls outputs)).toArray
+
+public def turnResultMessages {Tool : Type} (calls : Array (String × Tool))
+    (outputs : Array String) : Array Message :=
+  (turnResultMessageList (turnPairs calls outputs)).toArray
+
+/-- The call ids a list of events invokes, in order. -/
+public def invokedIds {Tool : Type} : List (Event Tool) → List String
+  | [] => []
+  | .invoke callId _ :: rest => callId :: invokedIds rest
+  | .result _ _ :: rest => invokedIds rest
+  | .repair _ _ :: rest => invokedIds rest
+  | .reasoning _ _ :: rest => invokedIds rest
+  | .finish _ :: rest => invokedIds rest
+
+/-- The results a list of events records, `(callId, output)` in order. -/
+public def recordedResults {Tool : Type} : List (Event Tool) → List (String × String)
+  | [] => []
+  | .result callId output :: rest => (callId, output) :: recordedResults rest
+  | .invoke _ _ :: rest => recordedResults rest
+  | .repair _ _ :: rest => recordedResults rest
+  | .reasoning _ _ :: rest => recordedResults rest
+  | .finish _ :: rest => recordedResults rest
+
+theorem turnEventList_length {Tool : Type} (pairs : List ((String × Tool) × String)) :
+    (turnEventList pairs).length = 2 * pairs.length := by
+  induction pairs with
+  | nil => rfl
+  | cons p rest ih =>
+    obtain ⟨⟨callId, tool⟩, output⟩ := p
+    simp [turnEventList, ih]
+    omega
+
+/-- Every call is invoked, once, in the model's order. -/
+theorem turnEventList_invokes {Tool : Type} (pairs : List ((String × Tool) × String)) :
+    invokedIds (turnEventList pairs) = pairs.map (·.1.1) := by
+  induction pairs with
+  | nil => rfl
+  | cons p rest ih =>
+    obtain ⟨⟨callId, tool⟩, output⟩ := p
+    simp [turnEventList, invokedIds, ih]
+
+/-- Every call is answered, once, under its own id and with its own output, in the
+model's order: no result is dropped, repeated or reattached. -/
+theorem turnEventList_results {Tool : Type} (pairs : List ((String × Tool) × String)) :
+    recordedResults (turnEventList pairs) = pairs.map fun p => (p.1.1, p.2) := by
+  induction pairs with
+  | nil => rfl
+  | cons p rest ih =>
+    obtain ⟨⟨callId, tool⟩, output⟩ := p
+    simp [turnEventList, recordedResults, ih]
+
+/-- A turn recorded this way is transparent to the event state machine when its ids
+are non-blank: `eventsGo_pair` for a turn of any length. -/
+theorem turnEventList_eventsGo {Tool : Type} (pairs : List ((String × Tool) × String))
+    (rest : List (Event Tool)) (h : ∀ p ∈ pairs, nonemptyText p.1.1 = true) :
+    Transcript.eventsGo none false (turnEventList pairs ++ rest) =
+      Transcript.eventsGo none false rest := by
+  induction pairs with
+  | nil => rfl
+  | cons p ps ih =>
+    obtain ⟨⟨callId, tool⟩, output⟩ := p
+    have hid : nonemptyText callId = true := h ((callId, tool), output) (by simp)
+    simp only [turnEventList, List.cons_append]
+    rw [Transcript.eventsGo_pair callId tool output _ hid]
+    exact ih fun q hq => h q (by simp [hq])
+
+/-- A turn of any number of calls, each with a non-blank id, followed by a non-blank
+finish, is a well-formed record. -/
+theorem turnEvents_wellFormed {Tool : Type} (calls : Array (String × Tool))
+    (outputs : Array String) (content : String)
+    (h : ∀ c ∈ calls, nonemptyText c.1 = true) (hc : nonemptyText content = true) :
+    Transcript.eventsWellFormed ((turnEvents calls outputs).push (.finish content)) = true := by
+  simp only [Transcript.eventsWellFormed, turnEvents, Array.toList_push]
+  rw [turnEventList_eventsGo]
+  · simp [Transcript.eventsGo, hc]
+  · intro p hp
+    obtain ⟨c, o⟩ := p
+    simp only [turnPairs, Array.toList_zip] at hp
+    exact h c (Array.mem_toList_iff.mp (List.of_mem_zip hp).1)
+
+/-- One tool message per call, under its own id, in the model's order. -/
+theorem turnResultMessageList_ids {Tool : Type} (pairs : List ((String × Tool) × String)) :
+    (turnResultMessageList pairs).map (·.toolCallId?) = pairs.map fun p => some p.1.1 := by
+  simp [turnResultMessageList, toolResultMessage]
+
+/-- The wire form of a turn's answers for the Messages API: right after the turn,
+one user message carrying one `tool_result` per call, under the call's id and
+with its output, in the model's order. -/
+theorem anthropicMessageList_turn {Tool : Type} (before : List Message) (a : Message)
+    (ha : a.role ≠ .tool) (pairs : List ((String × Tool) × String)) (hne : pairs ≠ []) :
+    anthropicMessageList (before ++ a :: turnResultMessageList pairs) =
+      anthropicMessageList (before ++ [a]) ++
+        [anthropicUserMessage (pairs.map fun p => anthropicToolResultBlock p.1.1 p.2)] := by
+  have hblocks : (turnResultMessageList pairs).map anthropicToolResultBlockOf =
+      pairs.map fun p => anthropicToolResultBlock p.1.1 p.2 := by
+    simp [turnResultMessageList, anthropicToolResultBlockOf, toolResultMessage]
+  rw [anthropicMessageList_batches before a ha]
+  · rw [hblocks]
+  · intro m hm
+    simp only [turnResultMessageList, List.mem_map] at hm
+    obtain ⟨p, _, rfl⟩ := hm
+    rfl
+  · cases pairs with
+    | nil => exact absurd rfl hne
+    | cons p rest => simp [turnResultMessageList]
 
 /-- Metadata plus event state machine: invoke/result call-ids match, at most one
 finish, and nothing follows finish. Not a signature or digest. -/

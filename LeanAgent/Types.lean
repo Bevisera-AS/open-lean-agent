@@ -29,6 +29,12 @@ public structure Message where
   content : String
   toolCallId? : Option String := none
   toolCallsJson? : Option String := none
+  /-- The assistant turn's content blocks as the provider returned them, a compressed
+  JSON array: for Anthropic, `thinking`, `redacted_thinking`, `text` and `tool_use`
+  in the model's order. The Anthropic encoder replays it verbatim, so the signed
+  thinking a turn's tool calls rest on reaches the model again; the OpenAI encoder
+  ignores it, since Chat Completions carries no such blocks. -/
+  contentBlocksJson? : Option String := none
   deriving Repr, BEq
 
 public inductive ExtractError where

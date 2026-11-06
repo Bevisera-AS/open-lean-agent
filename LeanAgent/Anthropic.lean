@@ -60,6 +60,21 @@ private def toolUseBlocks (toolCallsJson : String) : Array Json :=
     | .error _ => #[]
     | .ok arr => arr.filterMap openaiCallToToolUse
 
+@[expose] public def anthropicToolResultBlock (callId output : String) : Json :=
+  Json.mkObj [
+    ("type", Json.str "tool_result"),
+    ("tool_use_id", Json.str callId),
+    ("content", Json.str output)
+  ]
+
+/-- The `tool_result` block of a tool message. -/
+@[expose] public def anthropicToolResultBlockOf (m : Message) : Json :=
+  anthropicToolResultBlock (m.toolCallId?.getD "") m.content
+
+/-- A user message whose content is `blocks`. -/
+public def anthropicUserMessage (blocks : List Json) : Json :=
+  Json.mkObj [("role", Json.str "user"), ("content", Json.arr blocks.toArray)]
+
 public def splitSystem (msgs : Array Message) : String × Array Message :=
   let systemParts :=
     msgs.filterMap fun m =>
@@ -74,25 +89,116 @@ public def encodeAnthropicMessage (m : Message) : Json :=
   | .user =>
     Json.mkObj [("role", Json.str "user"), ("content", Json.str m.content)]
   | .assistant =>
-    match m.toolCallsJson? with
-    | none =>
-      Json.mkObj [("role", Json.str "assistant"), ("content", Json.str m.content)]
-    | some s =>
-      let uses := toolUseBlocks s
-      let blocks :=
-        if nonemptyText m.content then
-          #[Json.mkObj [("type", Json.str "text"), ("text", Json.str m.content)]] ++ uses
-        else uses
+    -- A turn the model produced goes back as it came, thinking blocks included;
+    -- one built by hand is synthesized from its text and calls.
+    match m.contentBlocksJson?.bind fun s => (Json.parse s).toOption.bind (·.getArr?.toOption) with
+    | some blocks =>
       Json.mkObj [("role", Json.str "assistant"), ("content", Json.arr blocks)]
-  | .tool =>
-    Json.mkObj [
-      ("role", Json.str "user"),
-      ("content", Json.arr #[Json.mkObj [
-        ("type", Json.str "tool_result"),
-        ("tool_use_id", Json.str (m.toolCallId?.getD "")),
-        ("content", Json.str m.content)
-      ]])
-    ]
+    | none =>
+      match m.toolCallsJson? with
+      | none =>
+        Json.mkObj [("role", Json.str "assistant"), ("content", Json.str m.content)]
+      | some s =>
+        let uses := toolUseBlocks s
+        let blocks :=
+          if nonemptyText m.content then
+            #[Json.mkObj [("type", Json.str "text"), ("text", Json.str m.content)]] ++ uses
+          else uses
+        Json.mkObj [("role", Json.str "assistant"), ("content", Json.arr blocks)]
+  | .tool => anthropicUserMessage [anthropicToolResultBlockOf m]
+
+/-- `pending` tool results not yet sent, flushed as one user message ahead of `tail`. -/
+public def anthropicFlush (pending tail : List Json) : List Json :=
+  if pending.isEmpty then tail else anthropicUserMessage pending :: tail
+
+public def anthropicMessagesGo (pending : List Json) : List Message → List Json
+  | [] => anthropicFlush pending []
+  | m :: rest =>
+    if m.role = .tool then anthropicMessagesGo (pending ++ [anthropicToolResultBlockOf m]) rest
+    else anthropicFlush pending (encodeAnthropicMessage m :: anthropicMessagesGo [] rest)
+
+/-- The conversation as the Messages API wants it, which is not one message per
+`Message`. An assistant turn that asks for several tools is answered by a single
+user message carrying one `tool_result` block per call, and roles alternate; so a
+run of consecutive tool messages becomes one message, in order, and everything
+else maps as it reads. `anthropicMessagesGo_batches` is that rule as a theorem. -/
+public def anthropicMessageList (msgs : List Message) : List Json :=
+  anthropicMessagesGo [] msgs
+
+theorem anthropicFlush_nil (tail : List Json) : anthropicFlush [] tail = tail := by
+  simp [anthropicFlush]
+
+theorem anthropicFlush_append (pending tail tail' : List Json) :
+    anthropicFlush pending (tail ++ tail') = anthropicFlush pending tail ++ tail' := by
+  unfold anthropicFlush
+  split <;> simp
+
+/-- A run of tool messages becomes the pending results, in order, and nothing else. -/
+theorem anthropicMessagesGo_tools (pending : List Json) (ts : List Message)
+    (h : ∀ m ∈ ts, m.role = .tool) :
+    anthropicMessagesGo pending ts =
+      anthropicFlush (pending ++ ts.map anthropicToolResultBlockOf) [] := by
+  induction ts generalizing pending with
+  | nil => simp [anthropicMessagesGo]
+  | cons m rest ih =>
+    have hm : m.role = .tool := h m (by simp)
+    simp only [anthropicMessagesGo, ite_eq_left hm]
+    rw [ih _ (fun x hx => h x (by simp [hx]))]
+    simp [List.append_assoc]
+
+/-- The results answering a turn go out as one user message, one `tool_result` block
+per tool message in the order given, right after the turn they answer; the
+messages before are encoded exactly as they would be without the results.
+`a` is the turn being answered, any message that is not itself a tool result. -/
+theorem anthropicMessagesGo_batches (pending : List Json) (before : List Message) (a : Message)
+    (ha : a.role ≠ .tool) (ts : List Message) (hts : ∀ m ∈ ts, m.role = .tool) (hne : ts ≠ []) :
+    anthropicMessagesGo pending (before ++ a :: ts) =
+      anthropicMessagesGo pending (before ++ [a]) ++
+        [anthropicUserMessage (ts.map anthropicToolResultBlockOf)] := by
+  induction before generalizing pending with
+  | nil =>
+    simp only [List.nil_append, anthropicMessagesGo, ite_eq_right ha, anthropicFlush_nil]
+    rw [anthropicMessagesGo_tools [] ts hts]
+    have hts' : anthropicFlush ([] ++ ts.map anthropicToolResultBlockOf) [] =
+        [anthropicUserMessage (ts.map anthropicToolResultBlockOf)] := by
+      cases ts with
+      | nil => exact absurd rfl hne
+      | cons m rest => simp [anthropicFlush]
+    rw [hts', ← anthropicFlush_append]
+    rfl
+  | cons b before' ih =>
+    simp only [List.cons_append, anthropicMessagesGo]
+    by_cases hb : b.role = .tool
+    · simp only [ite_eq_left hb]
+      exact ih _
+    · simp only [ite_eq_right hb]
+      rw [ih, ← anthropicFlush_append]
+      rfl
+
+theorem anthropicMessageList_batches (before : List Message) (a : Message) (ha : a.role ≠ .tool)
+    (ts : List Message) (hts : ∀ m ∈ ts, m.role = .tool) (hne : ts ≠ []) :
+    anthropicMessageList (before ++ a :: ts) =
+      anthropicMessageList (before ++ [a]) ++
+        [anthropicUserMessage (ts.map anthropicToolResultBlockOf)] :=
+  anthropicMessagesGo_batches [] before a ha ts hts hne
+
+-- Two results after a tool-calling turn go out as one user message; the rest map one to one.
+#guard
+  let msgs : List Message := [
+    { role := .user, content := "hi" },
+    { role := .assistant, content := "", toolCallsJson? := some "[]" },
+    { role := .tool, content := "1", toolCallId? := some "a" },
+    { role := .tool, content := "2", toolCallId? := some "b" },
+    { role := .user, content := "go on" }
+  ]
+  (anthropicMessageList msgs).map Json.compress == [
+    "{\"content\":\"hi\",\"role\":\"user\"}",
+    "{\"content\":[],\"role\":\"assistant\"}",
+    "{\"content\":[{\"content\":\"1\",\"tool_use_id\":\"a\",\"type\":\"tool_result\"}," ++
+      "{\"content\":\"2\",\"tool_use_id\":\"b\",\"type\":\"tool_result\"}],\"role\":\"user\"}",
+    "{\"content\":\"go on\",\"role\":\"user\"}"
+  ]
+#guard (anthropicMessageList []).isEmpty
 
 public def anthropicMaxTokens (cfg : ProviderConfig) : Nat :=
   cfg.maxTokens.getD 1024
@@ -109,10 +215,17 @@ public def anthropicRequest (cfg : ProviderConfig) (msgs : Array Message)
   let fields : List (String × Json) := [
     ("model", Json.str cfg.model),
     ("max_tokens", (anthropicMaxTokens cfg : Json)),
-    ("messages", Json.arr (rest.map encodeAnthropicMessage))
+    ("messages", Json.arr (anthropicMessageList rest.toList).toArray)
   ]
   let fields :=
     if nonemptyText sys then fields ++ [("system", Json.str sys)] else fields
+  let fields :=
+    match cfg.thinkingBudget with
+    | some n => fields ++ [("thinking", Json.mkObj [
+        ("type", Json.str "enabled"),
+        ("budget_tokens", (n : Json))
+      ])]
+    | none => fields
   let fields :=
     if tools.isEmpty then fields
     else fields ++ [
@@ -121,50 +234,59 @@ public def anthropicRequest (cfg : ProviderConfig) (msgs : Array Message)
     ]
   Json.mkObj fields
 
-public def wrapAnthropicText (content : String) : String :=
+/-- Test envelope: an Anthropic message with the given content blocks and stop reason. -/
+public def wrapAnthropicMessage (content : Array Json) (stopReason : String) : String :=
   Json.compress (Json.mkObj [
     ("id", Json.str "msg_test"),
     ("type", Json.str "message"),
     ("role", Json.str "assistant"),
-    ("content", Json.arr #[Json.mkObj [
-      ("type", Json.str "text"),
-      ("text", Json.str content)
-    ]]),
-    ("stop_reason", Json.str "end_turn")
+    ("content", Json.arr content),
+    ("stop_reason", Json.str stopReason)
   ])
 
+public def anthropicTextBlock (text : String) : Json :=
+  Json.mkObj [("type", Json.str "text"), ("text", Json.str text)]
+
+/-- A signed `thinking` block as the API returns one. -/
+public def anthropicThinkingBlock (thinking signature : String) : Json :=
+  Json.mkObj [
+    ("type", Json.str "thinking"),
+    ("thinking", Json.str thinking),
+    ("signature", Json.str signature)
+  ]
+
+public def anthropicToolUseBlock (id name argsJson : String) : Json :=
+  let input :=
+    match Json.parse argsJson with
+    | .ok j => j
+    | .error _ => Json.mkObj []
+  Json.mkObj [
+    ("type", Json.str "tool_use"),
+    ("id", Json.str id),
+    ("name", Json.str name),
+    ("input", input)
+  ]
+
+public def wrapAnthropicText (content : String) : String :=
+  wrapAnthropicMessage #[anthropicTextBlock content] "end_turn"
+
 public def wrapAnthropicTruncated (content : String) : String :=
-  Json.compress (Json.mkObj [
-    ("id", Json.str "msg_test"),
-    ("type", Json.str "message"),
-    ("role", Json.str "assistant"),
-    ("content", Json.arr #[Json.mkObj [
-      ("type", Json.str "text"),
-      ("text", Json.str content)
-    ]]),
-    ("stop_reason", Json.str "max_tokens")
-  ])
+  wrapAnthropicMessage #[anthropicTextBlock content] "max_tokens"
 
 /-- Test envelope: an Anthropic message whose content is the given
 `(id, name, inputJson)` `tool_use` blocks, in order. -/
 public def wrapAnthropicToolUses (uses : Array (String × String × String)) : String :=
-  Json.compress (Json.mkObj [
-    ("id", Json.str "msg_test"),
-    ("type", Json.str "message"),
-    ("role", Json.str "assistant"),
-    ("content", Json.arr (uses.map fun (id, name, argsJson) =>
-      let input :=
-        match Json.parse argsJson with
-        | .ok j => j
-        | .error _ => Json.mkObj []
-      Json.mkObj [
-        ("type", Json.str "tool_use"),
-        ("id", Json.str id),
-        ("name", Json.str name),
-        ("input", input)
-      ])),
-    ("stop_reason", Json.str "tool_use")
-  ])
+  wrapAnthropicMessage (uses.map fun (id, name, argsJson) => anthropicToolUseBlock id name argsJson)
+    "tool_use"
+
+/-- Test envelope: a signed `thinking` block, then the `tool_use` blocks it led to,
+as a thinking model asks for tools. -/
+public def wrapAnthropicThinkingToolUses (thinking signature : String)
+    (uses : Array (String × String × String)) : String :=
+  wrapAnthropicMessage
+    (#[anthropicThinkingBlock thinking signature] ++
+      uses.map fun (id, name, argsJson) => anthropicToolUseBlock id name argsJson)
+    "tool_use"
 
 public def wrapAnthropicToolUse (id name argsJson : String) : String :=
   wrapAnthropicToolUses #[(id, name, argsJson)]
@@ -236,6 +358,42 @@ public def anthropicReasoning (raw : String) : Option String :=
     let think := joinSep "\n" (blocks.toList.filterMap anthropicThinkingOfBlock)
     if nonemptyText think then some think else none
 
+/-- The `type` of a content block, when it has one. -/
+public def anthropicBlockType (j : Json) : Option String :=
+  match j.getObjVal? "type" with
+  | .ok ty => ty.getStr?.toOption
+  | .error _ => none
+
+/-- A block the Messages API returns for a request of ours and accepts back in an
+assistant turn. An empty text block is refused by the API, and any other type is
+not replayed. -/
+public def anthropicReplayableBlock (j : Json) : Bool :=
+  match anthropicBlockType j with
+  | some "thinking" | some "redacted_thinking" | some "tool_use" => true
+  | some "text" => (anthropicTextOfBlock j).any nonemptyText
+  | _ => false
+
+/-- The content of an Anthropic message as the model produced it, kept to the blocks
+`anthropicReplayableBlock` admits and compressed, for `Message.contentBlocksJson?`.
+The API checks each thinking block's signature against the blocks before it, so the
+array keeps its order and its text unmerged. `none` when the message does not
+decode or nothing in it is replayable. -/
+public def anthropicReplayBlocks (raw : String) : Option String :=
+  match anthropicContentBlocks raw with
+  | .error _ => none
+  | .ok blocks =>
+    let kept := blocks.filter anthropicReplayableBlock
+    if kept.isEmpty then none else some (Json.compress (Json.arr kept))
+
+/-- The block types of a compressed content array, for tests. -/
+public def anthropicBlockTypes (blocksJson : String) : Array String :=
+  match Json.parse blocksJson with
+  | .error _ => #[]
+  | .ok j =>
+    match j.getArr? with
+    | .error _ => #[]
+    | .ok arr => arr.filterMap anthropicBlockType
+
 /-- Read an optional `Nat` field, tolerating absence and non-numeric values.
 Never fails: usage accounting is best-effort. -/
 public def softNatField (j : Json) (key : String) : Option Nat :=
@@ -284,18 +442,45 @@ public def anthropicUsage (raw : String) : Usage :=
   | .ok "pong" => true
   | _ => false
 
-/-- Test envelope: a leading `thinking` block followed by a `text` block. -/
-public def wrapAnthropicThinking (thinking content : String) : String :=
-  Json.compress (Json.mkObj [
-    ("id", Json.str "msg_test"),
-    ("type", Json.str "message"),
-    ("role", Json.str "assistant"),
-    ("content", Json.arr #[
-      Json.mkObj [("type", Json.str "thinking"), ("thinking", Json.str thinking)],
-      Json.mkObj [("type", Json.str "text"), ("text", Json.str content)]
-    ]),
-    ("stop_reason", Json.str "end_turn")
-  ])
+/-- Test envelope: a signed `thinking` block followed by a `text` block. -/
+public def wrapAnthropicThinking (thinking content : String) (signature : String := "sig_test") :
+    String :=
+  wrapAnthropicMessage #[anthropicThinkingBlock thinking signature, anthropicTextBlock content]
+    "end_turn"
+
+-- A thinking turn is replayed in the model's order, signature included.
+#guard
+  let raw := wrapAnthropicThinkingToolUses "plan" "sig1" #[("t1", "echo", "{\"text\":\"a\"}")]
+  match anthropicReplayBlocks raw with
+  | some s =>
+    anthropicBlockTypes s == #["thinking", "tool_use"] && s.contains "\"signature\":\"sig1\"" &&
+      Json.compress (encodeAnthropicMessage { role := .assistant, content := "", contentBlocksJson? := some s }) ==
+        "{\"content\":" ++ s ++ ",\"role\":\"assistant\"}"
+  | none => false
+
+-- Blocks of a type the API would not accept back, and empty text, are not replayed;
+-- a message with nothing replayable yields `none`, and the encoder then synthesizes.
+#guard
+  let raw := wrapAnthropicMessage #[
+    Json.mkObj [("type", Json.str "server_tool_use"), ("id", Json.str "x")],
+    anthropicTextBlock "",
+    Json.mkObj [("type", Json.str "redacted_thinking"), ("data", Json.str "opaque")],
+    anthropicTextBlock "done"
+  ] "end_turn"
+  (anthropicReplayBlocks raw).map anthropicBlockTypes == some #["redacted_thinking", "text"]
+#guard (anthropicReplayBlocks (wrapAnthropicMessage #[anthropicTextBlock ""] "end_turn")).isNone
+#guard (anthropicReplayBlocks "not json").isNone
+#guard
+  Json.compress (encodeAnthropicMessage { role := .assistant, content := "hi", contentBlocksJson? := some "nope" }) ==
+    "{\"content\":\"hi\",\"role\":\"assistant\"}"
+
+-- The budget is requested only when set, and only by this encoder.
+#guard
+  let cfg : ProviderConfig := { anthropic with config := anthropic.config.withThinkingBudget (some 2048) }
+  let body := Json.compress (anthropicRequest cfg #[{ role := .user, content := "hi" }])
+  body.contains "\"thinking\":{\"budget_tokens\":2048,\"type\":\"enabled\"}"
+#guard
+  !(Json.compress (anthropicRequest anthropic #[{ role := .user, content := "hi" }])).contains "budget_tokens"
 
 #guard
   anthropicReasoning (wrapAnthropicThinking "let me reason" "pong") == some "let me reason"
