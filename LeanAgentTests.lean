@@ -576,13 +576,68 @@ def main : IO UInt32 := do
       anthCalled.events == #[.invoke "t1" (.echo "a"), .result "t1" "a",
         .invoke "t2" (.echo "b"), .result "t2" "b", .finish "a then b"] &&
       anthCalled.wellFormed)
-  assertTrue "anthropic: the second request echoes both tool_use blocks and answers each"
+  assertTrue "anthropic: the second request echoes both tool_use blocks and answers each in one user message"
     (match anthPosted[1]? with
      | some b =>
        (b.splitOn "\"type\":\"tool_use\"").length == 3 &&
          b.contains "\"tool_use_id\":\"t1\"" && b.contains "\"tool_use_id\":\"t2\"" &&
+         -- the prompt and the batched results: no user message per result
+         (b.splitOn "\"role\":\"user\"").length == 3 &&
+         (match Lean.Json.parse b with
+          | .ok j =>
+            (match (j.getObjVal? "messages").toOption.bind (·.getArr?.toOption) with
+             | some ms =>
+               ms.size == 3 &&
+                 (match ms[2]?.bind fun m => (m.getObjVal? "content").toOption.bind (·.getArr?.toOption) with
+                  | some blocks =>
+                    blocks.map (fun blk => (blk.getObjVal? "tool_use_id").toOption.bind (·.getStr?.toOption)) ==
+                      #[some "t1", some "t2"]
+                  | none => false)
+             | none => false)
+          | .error _ => false) &&
          !b.contains "Bearer"
      | none => false)
+  -- A thinking turn goes back to Anthropic as the model produced it: the signed
+  -- thinking block first, then the tool_use it led to. The audit keeps the thinking
+  -- text as a reasoning event and never the signature.
+  let thinkingUse := wrapAnthropicThinkingToolUses "I should echo a." "sig-abc123"
+    #[("t9", "echo", "{\"text\":\"a\"}")]
+  let thinkReplies ← IO.mkRef [thinkingUse, wrapAnthropicThinking "done thinking" "a" "sig-def456"]
+  let thinkBodies ← IO.mkRef (#[] : Array String)
+  let thinking : Completer := {
+    post := fun _url body => do
+      thinkBodies.modify (·.push body)
+      match ← thinkReplies.get with
+      | [] => pure (.err { body := "script exhausted" })
+      | r :: rest =>
+        thinkReplies.set rest
+        pure (.ok 200 r)
+  }
+  let thinkingCfg : ProviderConfig :=
+    { anthropic with config := anthropic.config.withThinkingBudget (some 2048) }
+  let thought ← ask thinking thinkingCfg "echo a" {} (stubArxivRunner observed) "run-thinking"
+  let thinkPosted ← thinkBodies.get
+  assertTrue "anthropic: the thinking budget is requested"
+    (match thinkPosted[0]? with
+     | some b => b.contains "\"budget_tokens\":2048" && b.contains "\"type\":\"enabled\""
+     | none => false)
+  assertTrue "anthropic: the signed thinking block is replayed before its tool_use"
+    (match thinkPosted[1]? with
+     | some b =>
+       b.contains "\"signature\":\"sig-abc123\"" &&
+         b.contains "\"thinking\":\"I should echo a.\"" &&
+         (match b.splitOn "\"type\":\"tool_use\"" with
+          | before :: _ => before.contains "\"type\":\"thinking\""
+          | [] => false) &&
+         b.contains "\"tool_use_id\":\"t9\"" &&
+         !b.contains "Bearer"
+     | none => false)
+  assertTrue "anthropic: thinking is audited per turn, the run finishes, and the signature stays off the record"
+    (thought.stop == .finished &&
+      thought.events == #[.reasoning 1 "I should echo a.", .invoke "t9" (.echo "a"), .result "t9" "a",
+        .reasoning 2 "done thinking", .finish "a"] &&
+      thought.wellFormed &&
+      !(encodeJsonl thought).contains "sig-abc123")
   -- One invented name in a multi-call turn refuses the whole turn; the echo beside
   -- it does not run.
   let mixed : Completer := {

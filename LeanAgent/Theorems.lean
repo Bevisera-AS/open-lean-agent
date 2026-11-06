@@ -133,4 +133,56 @@ theorem replay_rejects_tampered_result :
      | .error (.illFormed "transcript.result" "output does not match execute") => true
      | _ => false) = true := by decide +kernel
 
+/-! ## The storage round trip, for every value
+
+A transcript line written by the encoder and read back by the decoder is the value
+it was, for every value, not only the fixtures above. The object maps involved have
+fixed keys, so each decode reduces to its result by definitional unfolding alone,
+whatever the strings and numbers inside: these proofs are `rfl`. The two decoders
+that refuse a blank value are first stated with their condition, then discharged by
+it. The text level, `Json.compress` then `Json.parse`, is Lean core's and is checked
+on a fixture by `lake test`, not proved here. -/
+
+theorem decodeTaggedDemoTool_encodeDemoTool (t : DemoTool) (h : nonemptyText t.payload = true) :
+    decodeTaggedDemoTool (encodeDemoTool t) = .ok t := by
+  cases t with
+  | echo text =>
+    have step : decodeTaggedDemoTool (encodeDemoTool (.echo text)) =
+        if nonemptyText text then .ok (.echo text)
+        else .error (.illFormed "tool.text" "blank") := rfl
+    simp only [DemoTool.payload] at h
+    simp [step, h]
+  | arxivSearch query =>
+    have step : decodeTaggedDemoTool (encodeDemoTool (.arxivSearch query)) =
+        if nonemptyText query then .ok (.arxivSearch query)
+        else .error (.illFormed "tool.query" "blank") := rfl
+    simp only [DemoTool.payload] at h
+    simp [step, h]
+
+/-- Every event decodes to itself, given only what `Event.decodable` asks: that a
+reasoning line and an invoked tool's payload are not blank. The call id, output,
+detail, attempt and turn are arbitrary. -/
+theorem decodeEvent_encodeEvent (e : Event DemoTool) (h : e.decodable = true) :
+    decodeEvent (encodeEvent e) = .ok e := by
+  cases e with
+  | invoke callId tool =>
+    have step : decodeEvent (encodeEvent (.invoke callId tool)) =
+        (decodeTaggedDemoTool (encodeDemoTool tool)).bind fun t => .ok (.invoke callId t) := rfl
+    simp only [Event.decodable] at h
+    rw [step, decodeTaggedDemoTool_encodeDemoTool tool h]
+    rfl
+  | result callId output => rfl
+  | repair attempt detail => rfl
+  | reasoning turn content =>
+    have step : decodeEvent (encodeEvent (.reasoning turn content)) =
+        if nonemptyText content then .ok (.reasoning turn content)
+        else .error (.illFormed "event" "blank reasoning") := rfl
+    simp only [Event.decodable] at h
+    simp [step, h]
+  | finish content => rfl
+
+/-- Every stop reason decodes to itself, whatever the attempt count. -/
+theorem decodeStop_encodeStop (s : StopReason) : decodeStop (encodeStop s) = .ok s := by
+  cases s <;> rfl
+
 end LeanAgent

@@ -93,7 +93,7 @@ public def ToolSet.assistantInvokeMessage {Tool : Type} (ts : ToolSet Tool)
     (callId : String) (tool : Tool) : Message :=
   ts.assistantInvokesMessage #[(callId, tool)]
 
-public def toolResultMessage (callId : String) (output : String) : Message := {
+@[expose] public def toolResultMessage (callId : String) (output : String) : Message := {
   role := .tool
   content := output
   toolCallId? := some callId

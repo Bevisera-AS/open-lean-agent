@@ -90,6 +90,12 @@ public def decodeTaggedDemoTool (j : Json) : Except DecodeError DemoTool := do
     else .error (.illFormed "tool.query" "blank")
   | other => .error (.invalidTag ctx "tag" other)
 
+/-- The string a tool carries. The decoders refuse a blank one, so it is the one
+condition the tagged round trip needs (`decodeTaggedDemoTool_encodeDemoTool`). -/
+public def DemoTool.payload : DemoTool → String
+  | .echo text => text
+  | .arxivSearch query => query
+
 /-- Pure kernel tools return `some`. `arxiv_search` is an observation, not in this module. -/
 public def execute? : DemoTool → Option String
   | .echo text => some text

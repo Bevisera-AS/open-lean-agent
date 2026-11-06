@@ -213,6 +213,22 @@ public def completionReasoning (raw : String) (protocol : Protocol := .openAICha
               | some s => some s
               | none => softStrField msg "reasoning"
 
+/-- The assistant turn's content as the provider returned it, for
+`Message.contentBlocksJson?`. Only the Messages API hands back blocks a request must
+carry again; a Chat Completions turn is synthesized from its text and calls. -/
+public def completionReplayBlocks (raw : String) (protocol : Protocol := .openAIChat) :
+    Option String :=
+  match protocol with
+  | .anthropicMessages => anthropicReplayBlocks raw
+  | .openAIChat => none
+
+-- Chat Completions has no place for replayed blocks: the field is ignored.
+#guard
+  let blocks := anthropicReplayBlocks (wrapAnthropicThinking "secret plan" "hi" "sig9")
+  let body := Json.compress (encodeMessage { role := .assistant, content := "hi", contentBlocksJson? := blocks })
+  body == "{\"content\":\"hi\",\"role\":\"assistant\"}"
+#guard (completionReplayBlocks (wrapContentReasoning "why" "hi") .openAIChat).isNone
+
 /-- Envelope extras (`id`, `usage`, …) are ignored. Payload extras are not. -/
 public def messageContent (raw : String) (protocol : Protocol := .openAIChat) :
     Except DecodeError String :=

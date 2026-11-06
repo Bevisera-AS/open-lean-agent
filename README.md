@@ -37,7 +37,10 @@ and the FIPS 180-4 "abc" vector for the transcript digest
 (`Sha256.hashBytes_abc`). Those check one input each. The quantified facts are
 theorems next to their decoders: `decode` succeeds only on a name the catalog
 declares, for every string (`mkToolSet_decode_declared`,
-`decodeDemoTool_ok_name`, and the tagged, run-kind, event and stop forms).
+`decodeDemoTool_ok_name`, and the tagged, run-kind, event and stop forms), and
+every transcript event and stop reason decodes to itself, for every call id,
+output, count and payload (`decodeEvent_encodeEvent`, `decodeStop_encodeStop`,
+`decodeTaggedDemoTool_encodeDemoTool`), proved by definitional unfolding alone.
 Those are what `lake check` re-verifies, besides the definitions and the
 absence of `sorry` and `native_decide`. The remaining `#guard`s and the test binary are evaluated by
 the compiler and interpreter at build and test time and are not part of what
@@ -65,6 +68,9 @@ confine, so a caller who needs it must add it outside.
 | An unlisted provider | `ProviderId` is a closed inductive | `namedProvider` test | |
 | API keys | modeled as env-var names | tests: never in argv, never in the JSONL | the key's use by curl |
 | The `ask` loop terminates with a typed `StopReason`, even when a tool throws | | tests: refusal, transport, truncation, throwing runner | |
+| Every call of a turn is invoked once and answered once, under its own id and with its own output, in the model's order, and the record stays well-formed | | theorems `turnEventList_invokes`, `turnEventList_results`, `turnEvents_wellFormed` on the pure bookkeeping `askWith` records (`LeanAgent/Transcript.lean`); `lake test`: a throwing runner's call is answered with the error | what a call's output is: the runner's `IO` is not confined, and `askWith` supplying one output per call is a property of the loop, not a theorem |
+| A turn's results reach Anthropic as one user message, one `tool_result` per call, in order, right after the turn | | theorem `anthropicMessageList_turn` (every turn, every history before it); `lake test` on a two-call turn | |
+| A transcript line read back is the value written | | theorems `decodeEvent_encodeEvent` (every event whose reasoning and tool payload are non-blank, `Event.decodable`), `decodeStop_encodeStop` and `decodeTaggedDemoTool_encodeDemoTool`, at the JSON value level; `lake test` on the JSONL fixtures | the text level: `Json.compress` then `Json.parse` is Lean core's |
 | Replay detects a tampered pure-tool result | | theorem `replay_rejects_tampered_result` | observations (`arxiv_search`, files, lake) keep the recorded string |
 | The digest covers every line, usage included | | `lake test`: an edited finish or reasoning line, a usage key the encoder never writes, a deleted digest under `DigestPolicy.require` | the digest is not a signature; a decode under `verifyIfPresent` accepts a header with no digest |
 | A file tool stays under its root | | theorems on `safeRelPath` (lexical); `lake test` on `Files.confine`, which follows symlinks | a hard link; a path the OS user can reach that the real path check mis-reads |
@@ -104,7 +110,9 @@ audit transcript under `.lean-agent-audit/` (override with `LEAN_AGENT_AUDIT_DIR
 `bedrock-mantle`, `openai`, `anthropic`, or `glm`. Overlay the model, base URL
 and output cap with `LEAN_AGENT_MODEL` / `LEAN_AGENT_BASE_URL` /
 `LEAN_AGENT_MAX_TOKENS` (the default cap is 1024; a reasoning model spends it on
-its reasoning, so raise it).
+its reasoning, so raise it). `LEAN_AGENT_THINKING_BUDGET` turns on Anthropic's
+extended thinking with that many tokens of budget; the Messages API requires the
+output cap to exceed it. The other providers reason on their own and ignore it.
 
 | Provider        | Protocol            | API key env               |
 | --------------- | ------------------- | ------------------------- |
@@ -153,9 +161,15 @@ and/or structured `outputJson`).
 
 Reasoning is captured as a first-class, audit-only `Event.reasoning` decoded from
 provider fields — OpenAI-compatible `reasoning_content` / `reasoning` and
-Anthropic `thinking` content blocks. It is never fed back to the model, never
-treated as output, and is ignored by `replay`, so it cannot spoof the
-tamper-evidence check. Absence of reasoning is never an error.
+Anthropic `thinking` content blocks. The event is never treated as output and is
+ignored by `replay`, so it cannot spoof the tamper-evidence check. Absence of
+reasoning is never an error. What goes back to the model is a separate matter:
+an Anthropic assistant turn is replayed as the model produced it, signed
+`thinking` and `redacted_thinking` blocks included (`Message.contentBlocksJson?`,
+filled by `completionReplayBlocks`), because the Messages API refuses a
+tool-calling turn whose thinking is missing or altered; the signature never
+reaches the transcript. OpenAI-compatible reasoning fields are never re-sent,
+since Chat Completions has no place for them.
 
 ```jsonl
 {"tag":"header","runId":"run-...","kind":"ask","prompt":"...","providerId":"ollama","model":"...","toolsOffered":["arxiv_search"],"spec":null,"digest":"sha256:<64 hex>"}
@@ -269,7 +283,9 @@ releases the next change request only when the tests pass and records the stages
 released in `stage.json`; `refereeGate`, the loop's finish hook
 (`AskPolicy.onFinish`), reads it after every model finish and either accepts or
 nudges the model in the same history. The builder runs on the kernel's one loop,
-`askWith`, which runs every tool call of a turn in order. The **reviewer** is the
+`askWith`, which runs every tool call of a turn in order and records the turn
+through `turnEvents` and `turnResultMessages`, pure functions whose per-call
+contract is proved. The **reviewer** is the
 read-only `Roles.Reader` agent, and its findings come back through the fail-closed
 `OutputContract` as typed `Finding` values (run, requirement, kind, severity,
 evidence, note), the row shape of lean-spec's `bench/Findings.lean`.
@@ -312,6 +328,18 @@ docs/                       — lake check --paranoid report
 
 This package builds independently and must not import `LeanSpec.*` or
 `LeanSpecAgent.*`; a test (`checkImportFirewall`) enforces that.
+
+## Related work
+
+[lean-llmclient](https://github.com/paulbutcher/lean-llmclient), by Paul Butcher,
+is a provider-agnostic Lean 4 client for the OpenAI, Anthropic and Bedrock
+Converse chat APIs: one request/response vocabulary, a `Provider` interface, and a
+pure tool-calling loop with a kernel-checked termination measure, buildable for
+the browser as well as natively. It sits at the client layer beneath this
+package; the closed catalogs, audit transcripts and structured output here have
+no counterpart there, by design. The Anthropic thinking replay above follows its
+approach: an assistant turn is kept as the ordered blocks the model produced and
+sent back unchanged.
 
 ## Public release
 

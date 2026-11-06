@@ -1,2 +1,9 @@
 lean-agent
 Copyright 2026 Bevisera AS
+
+This product includes software adapted from CSLib, the Lean library for
+Computer Science (https://github.com/leanprover/cslib), Copyright (c) 2025-2026
+Fabrizio Montesi and the CSLib contributors, licensed under the Apache License,
+Version 2.0. The adapted parts are in LeanAgent/Semantics/ (labelled and
+functional transition systems, runs, and step invariants), restated without
+Mathlib; each file names its CSLib source.
