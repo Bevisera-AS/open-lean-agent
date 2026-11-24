@@ -14,7 +14,7 @@
 
 FROM debian:bookworm-slim
 
-ARG LEAN_TOOLCHAIN=leanprover/lean4:v4.35.0
+ARG LEAN_TOOLCHAIN=leanprover/lean4:v4.37.0-rc1
 
 # bubblewrap: `lake check` sandboxes the code it checks with `bwrap`.
 RUN apt-get update \

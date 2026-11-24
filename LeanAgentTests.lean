@@ -96,7 +96,7 @@ def builderTests : IO Unit := do
   assertTrue "a flag as target is refused" (!flagged.ok)
   -- The real thing.
   let version ← Build.toolchain sandbox "build-ok"
-  assertTrue "toolchain reports the pinned Lean" ((version.splitOn "v4.35.0").length > 1)
+  assertTrue "toolchain reports the pinned Lean" ((version.splitOn "v4.37.0-rc1").length > 1)
   let good ← Build.lakeBuild sandbox "build-ok" "default"
   assertTrue "lake_build passes on the good fixture" (good.ok && good.diagnostics.isEmpty)
   let bad ← Build.lakeBuild sandbox "build-fail" "default"

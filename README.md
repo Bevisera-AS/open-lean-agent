@@ -11,7 +11,7 @@ error, never a silent runtime path. JSON decoding is fail-closed (unknown fields
 are rejected). Secrets are modeled as environment-variable *names*, never values,
 and never appear in process arguments or transcripts.
 
-Split from `lean-spec`. Same toolchain: Lean 4.35.
+Split from `lean-spec`. Toolchain: Lean 4.37.0-rc1.
 
 ## Validate
 
@@ -25,8 +25,8 @@ lake check --paranoid                             # Linux only; see below
 `lake build` also runs the pervasive compile-time `#guard` checks; `lake test`
 additionally runs the `lean-agent-tests` binary.
 
-Under Lean 4.35.0, `lake check --paranoid` accepts the library, sandboxed, with all
-six bundled checkers, including the verified kernels con-leche and con-ron, and
+Under Lean 4.35.0, `lake check --paranoid` accepts the library, sandboxed, with
+all six bundled checkers (not yet re-run on 4.37.0-rc1), including the verified kernels con-leche and con-ron, and
 with only the standard axioms (`propext`, `Quot.sound`, `Classical.choice`). CI
 runs it on every merge request, on `main` and on tags. The pure checks that the
 kernel can decide are theorems, proved `by decide`: the path rule

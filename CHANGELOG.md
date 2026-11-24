@@ -11,6 +11,16 @@ axioms (`propext`, `Quot.sound`, `Classical.choice`).
 
 ## [Unreleased]
 
+### Changed (build)
+- **Toolchain is Lean 4.37.0-rc1 (was 4.35.0).** No library, example or theorem
+  source changed: `lake build`, the four executables and `lake test` pass as they
+  were, with no new warnings. `lean-toolchain`, the fixture packages
+  `fixtures/build-ok` and `fixtures/build-fail`, the CI image default
+  (`ci/Dockerfile`) and the pinned-image example in `.gitlab-ci.yml` name the new
+  toolchain; the `toolchain` test in `LeanAgentTests.lean` now expects
+  `v4.37.0-rc1` from the fixture. `lake check --paranoid` has not yet been re-run
+  on 4.37.0-rc1 (it needs Linux).
+
 ## [0.5.0] — 2026-11-06
 
 ### Added
